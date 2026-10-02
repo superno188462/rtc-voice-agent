@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rtc-voice-agent.local/schemas/user-profile-v1.json",
+  "title": "RTC Voice Agent user profile v1",
+  "description": "Stable, non-sensitive user preferences used to personalize future conversations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Profile schema version owned and validated by this project."
+    },
+    "preferred_language": {
+      "type": "string",
+      "enum": ["zh-CN", "en-US"],
+      "description": "Explicitly expressed preferred response language."
+    },
+    "response_style": {
+      "type": "string",
+      "enum": ["concise", "balanced", "detailed"],
+      "description": "Explicitly expressed preferred response detail level."
+    },
+    "interests": {
+      "$ref": "#/$defs/stringList",
+      "description": "Stable user interests explicitly stated in conversation."
+    },
+    "food_preferences": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "likes": {
+          "$ref": "#/$defs/stringList",
+          "description": "Foods the user explicitly said they like."
+        },
+        "dislikes": {
+          "$ref": "#/$defs/stringList",
+          "description": "Foods the user explicitly said they dislike."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80
+      }
+    }
+  }
+}

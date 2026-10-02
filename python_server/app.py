@@ -26,8 +26,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from services.llm import get_llm_service
 from services.rag import get_rag_service
 from services.agent import agent_service
+from services.agent.conversation_repository import (
+    TurnStateError,
+    get_or_create_user_conversation,
+)
 from services.trace_service import mark_turn_event
 from services.asr import create_asr_client
+from services.context_gateway import ContextGatewayError, get_context_gateway
 from tools.rtc_token import AccessToken, Privileges
 from tools.util import assert_value, read_files, wrapper
 
@@ -103,7 +108,9 @@ class AgentSessionRequest(BaseModel):
 class AgentTurnRequest(BaseModel):
     text: str = Field(description="ASR 确认后的用户转写文本。")
     turn_id: Optional[str] = Field(
-        default=None, description="前端为单轮语音分配的追踪 ID，用于关联 ASR 与 LLM 耗时。"
+        default=None,
+        max_length=128,
+        description="前端为单轮语音分配的唯一 ID，用于耗时关联和防止重复写入。",
     )
 
 
@@ -420,21 +427,24 @@ async def create_agent_session(
     request: AgentSessionRequest,
     user: User = Depends(require_current_user),
 ) -> dict[str, Any]:
-    """创建自有 Agent 会话。媒体机器人尚未接入时，此接口只管理编排会话。"""
+    """创建本次临时 RTC Agent 连接，并关联当前用户的稳定逻辑对话。"""
 
     scene = SCENES.get(request.scene_id)
     if not scene:
         return JSONResponse({"error": {"code": "SCENE_NOT_FOUND"}}, status_code=404)
     agent_config = scene.get("AgentConfig") or {}
+    conversation_id = await get_or_create_user_conversation(user.id)
     session = await agent_service.create_session(
         request.scene_id,
         request.room_id,
         request.user_id,
         user.id,
+        conversation_id,
         agent_config.get("GatewayProfileId", ""),
     )
     return {
         "session_id": session.session_id,
+        "conversation_id": conversation_id,
         "status": "created",
         "media_status": "not_connected",
     }
@@ -461,6 +471,11 @@ async def agent_turn(
             ):
                 yield f"data: {json.dumps({'type': 'text_delta', 'text': text_delta}, ensure_ascii=False)}\n\n"
             yield 'data: {"type":"done"}\n\n'
+        except ContextGatewayError as exc:
+            print(f"[agent] context turn failed code={exc.code} status={exc.status_code or 'none'}")
+            yield f"data: {json.dumps({'type': 'error', 'code': exc.code})}\n\n"
+        except TurnStateError as exc:
+            yield f"data: {json.dumps({'type': 'error', 'code': exc.code})}\n\n"
         except (httpx.HTTPError, RuntimeError, ValueError, KeyError, IndexError) as exc:
             # 客户端只收稳定错误类型；服务端记录异常类别，不记录凭据或对话内容。
             print(f"[agent] LLM turn failed: {type(exc).__name__}")
@@ -471,6 +486,30 @@ async def agent_turn(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/agent/sessions/{session_id}/messages")
+async def agent_session_messages(
+    session_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    user: User = Depends(require_current_user),
+) -> dict[str, Any]:
+    """读取当前逻辑会话的 Gateway 短期消息，用于新 RTC 房间恢复字幕。"""
+
+    session = await agent_service.get_session(session_id)
+    if not _session_is_owned(session, user):
+        return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
+    try:
+        messages = await get_context_gateway().get_messages(
+            user.id, session.conversation_id, limit=limit
+        )
+    except ContextGatewayError as exc:
+        print(f"[agent] context history failed code={exc.code} status={exc.status_code or 'none'}")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code},
+        ) from exc
+    return {"conversation_id": session.conversation_id, "messages": messages}
 
 
 @app.post("/api/agent/sessions/{session_id}/mock-turns")

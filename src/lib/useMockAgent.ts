@@ -11,6 +11,7 @@ import { RootState } from '@/store';
 import RtcClient from '@/lib/RtcClient';
 import { AIGC_PROXY_HOST } from '@/config';
 import {
+  clearHistoryMsg,
   setHistoryMsg,
   updateAIGCState,
   updateASRPartialText,
@@ -32,6 +33,21 @@ type VoiceTurn = {
   speechEndAt?: number;
   firstPartialAt?: number;
 };
+
+function getAgentErrorMessage(code: string): string {
+  const messages: Record<string, string> = {
+    CONTEXT_SERVICE_NOT_CONFIGURED: '对话上下文服务尚未配置，请联系管理员检查后端环境变量。',
+    CONTEXT_AUTH_FAILED: '对话上下文服务鉴权失败，请检查项目 API Key。',
+    CONTEXT_RESOURCE_NOT_FOUND: '网关中找不到配置的提示词模板或会话资源。',
+    CONTEXT_SERVICE_TIMEOUT: '对话上下文服务响应超时，请稍后重试。',
+    CONTEXT_APPEND_UNCERTAIN: '本轮回复已生成，但记忆写入状态未能确认；请稍后继续，避免重复提交。',
+    CONTEXT_VERSION_CONFLICT: '用户画像正在被更新，请稍后重试。',
+    TURN_ALREADY_COMPLETED: '这轮对话已经处理完成。',
+    TURN_ALREADY_IN_PROGRESS: '这轮对话仍在处理中。',
+    TURN_ID_REUSED_WITH_DIFFERENT_INPUT: '轮次标识冲突，请重新说一次。',
+  };
+  return messages[code] || `Agent 请求失败：${code}`;
+}
 
 const VAD_RMS_THRESHOLD = 0.012;
 const VAD_SILENCE_MS = 600;
@@ -206,6 +222,45 @@ export default function useMockAgent(): void {
         }
 
         sessionId.current = createdSessionId;
+        dispatch(clearHistoryMsg());
+        try {
+          const historyResponse = await fetch(
+            `${AIGC_PROXY_HOST}/api/agent/sessions/${createdSessionId}/messages?limit=50`,
+            { credentials: 'include' }
+          );
+          if (!historyResponse.ok) {
+            const historyError = await historyResponse.json().catch(() => ({}));
+            throw new Error(historyError?.detail?.code || `HTTP ${historyResponse.status}`);
+          }
+          const historyData = await historyResponse.json();
+          const ownerId = room.localUser.userId || '';
+          const assistantName = botNameRef.current;
+          (historyData?.messages || []).forEach((message: { role: string; content: string }) => {
+            if (message.role === 'user') {
+              dispatch(
+                setHistoryMsg({ text: message.content, user: ownerId, paragraph: true, definite: true })
+              );
+            } else if (message.role === 'assistant') {
+              dispatch(
+                setHistoryMsg({
+                  text: message.content,
+                  user: assistantName,
+                  paragraph: true,
+                  definite: true,
+                })
+              );
+            }
+          });
+        } catch (error) {
+          Message.error(`读取历史对话失败：${getAgentErrorMessage(String(error).replace(/^Error: /, ''))}`);
+        }
+        if (cancelled) {
+          await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions/${createdSessionId}`, {
+            method: 'DELETE',
+            credentials: 'include',
+          });
+          return;
+        }
         const socketUrl = AIGC_PROXY_HOST.replace(/^http/, 'ws').replace(/\/$/, '');
         localSocket = new WebSocket(`${socketUrl}/api/agent/sessions/${createdSessionId}/asr`);
         socketRef.current = localSocket;
@@ -379,7 +434,8 @@ export default function useMockAgent(): void {
                 }
               })
               .catch((error) => {
-                Message.error(`LLM 调用失败：${String(error)}`);
+                const code = String(error).replace(/^Error: /, '');
+                Message.error(getAgentErrorMessage(code));
               })
               .finally(() => {
                 dispatch(updateAITalkState({ isAITalking: false }));

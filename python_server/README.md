@@ -58,6 +58,18 @@ uv run alembic upgrade head
 
 React 已接入登录/注册页、刷新后登录态恢复和路由保护；认证状态以服务端 `/api/auth/me` 为准，顶部显示账号并提供退出登录。登录后的 `/getScenes` 每次签发独立 RTC 房间、RTC user_id 和短期 Token，避免多个用户共用场景文件里的固定 RTC 身份。Agent 会话创建、ASR WebSocket、LLM 轮次、打断和关闭接口要求 HttpOnly Cookie 登录态，且会校验会话所属账号。旧调试接口和 RTC OpenAPI 代理也要求登录；遗留 CustomLLM callback 使用单独 Bearer Key。RTC `user_id` 与账号 ID 分开保存和使用。账号/登录方案、网关认证对照及后续对话持久化计划见根目录《登录与账号体系设计.md》。
 
+## Agent Gateway 项目上下文
+
+在后端 `.env` 配置 `GATEWAY_CONTEXT_BASE_URL`（本地示例 `http://127.0.0.1:8000/v1/context`）和 `GATEWAY_PROJECT_API_KEY`。生产可将地址设为 `https://<网关域名>/gateway/v1/context`。提示词模板优先通过 `GATEWAY_CONTEXT_TEMPLATE_ID` 按 ID 读取；该项留空时，才使用 `GATEWAY_CONTEXT_TEMPLATE_CATEGORY` 和 `GATEWAY_CONTEXT_TEMPLATE_NAME`。Key 只由 Python 后端读取，Agent Gateway 项目 ID 从 Key 推导，本项目不向接口传 `project_id`。
+
+当前每个本地账号有一个稳定 `conversation_id`，由本项目 PostgreSQL 只保存 ID 与用户归属；Agent Gateway 的 `external_user_id` 使用服务端认证得到的 `User.id`，其短期会话 `session_id` 使用此 `conversation_id`。RTC 房间及 AgentSession 每次开房都重新创建并关联同一对话，因此离开或重开房间不会清除对话。新房间创建后前端会读取最近 50 条网关消息恢复字幕；LLM 每轮也从网关读取模板、画像、短期历史及最多 5 页长期记忆，并把与当前问题词项相关的记忆拼进 system context。RAG 仍通过现有服务接口在调用 LLM 前加入。
+
+回答调用仍按原流程流式生成，并在成功后将本轮 user/assistant 消息成对追加到网关，默认 TTL 24 小时（`GATEWAY_CONTEXT_TTL_SECONDS`，网关允许 60 秒至 30 天）。每轮还会并行发起一个独立、非流式的 LLM 记忆提取调用，共用 `LLM_API_BASE`、`LLM_API_KEY`、`LLM_MODEL`；`LLM_MEMORY_EXTRACT_MAX_TOKENS` 默认 300。该调用只返回候选，不直接写库。后端要求每条候选包含能在当前或最近用户原话中找到的证据，并校验字段、类型、长度、置信度及敏感信息，校验失败或提取服务失败不会影响回答。回答 LLM 不知道后台持久化结果，因此 system prompt 明确禁止它声称信息已经保存。
+
+用户画像 JSON Schema 位于 `python_server/schemas/user_profile.schema.json`，schema v1 包含 `preferred_language`（`zh-CN`/`en-US`）、`response_style`（`concise`/`balanced`/`detailed`）、`interests` 字符串数组，以及 `food_preferences.likes` / `food_preferences.dislikes` 字符串数组。每项变更必须有用户原话证据且置信度至少为 `AGENT_MEMORY_MIN_CONFIDENCE`（默认 0.75）；画像冲突时重读并合并，重复值不会重复写入。符合这些字段的稳定偏好写入画像；其他明确、稳定且未来有用的事实写入长期记忆。例如“我正在备考教师资格证”归入长期记忆，带受控标签 `学习目标`、`当前目标`、`稳定背景`、`项目经历` 或 `其他`。网关条目还带 `模型提取` 来源标签、`source=llm_extraction`、置信度和项目 schema 版本。一次性信息、推测及敏感信息不保存。记忆提取由独立任务执行，关闭 RTC 房间不会取消；同一用户下一轮开始前等待前一轮提取完成。提取调用 token 上限和超时分别由 `LLM_MEMORY_EXTRACT_MAX_TOKENS`（默认 300）与 `LLM_MEMORY_EXTRACT_TIMEOUT_SECONDS`（默认 20 秒，范围 3–60）控制。
+
+当前短期记忆读取依赖网关返回按顺序排列的 `messages`，画像读取依赖 `profile` 和可选 `version`，模板响应支持 `content`、`template_content` 或 `prompt` 字段。首次使用时，短期消息或画像资源 GET 返回 404 会按“尚未初始化”处理为空；模板、长期记忆、鉴权及网络错误不会伪装成空数据。后端只记录错误类别和 HTTP 状态，不记录 Key、对话、画像或长期记忆正文。`agent_turns` 表只记录轮次 ID、状态和 SHA-256 摘要，不存正文。网关追加超时后会读取最近消息核对；若仍无法确认，会阻止同一逻辑会话的后续追加，避免盲目重复，需先排查网关状态。
+
 ## 场景配置
 
 服务只读取 `python_server/scenes/*.json`。自有 Agent 场景按 `Custom.json.example` 配置：
