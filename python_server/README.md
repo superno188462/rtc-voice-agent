@@ -39,6 +39,25 @@ cd python_server
 uv sync
 ```
 
+## 项目账号登录（首版后端）
+
+认证由本项目管理，不依赖 AI 网关账号。设置 `.env` 中的 `DATABASE_URL` 后运行迁移：
+
+```powershell
+uv run alembic upgrade head
+```
+
+认证接口：
+
+- `POST /api/auth/register`：用户名/密码注册，成功后自动登录。
+- `POST /api/auth/login`：登录并设置 HttpOnly Cookie。
+- `GET /api/auth/me`：读取当前登录用户。
+- `POST /api/auth/logout`：撤销当前会话并清除 Cookie。
+
+首版要求密码长度为 8–128 位；服务端使用 Argon2 哈希密码，并在数据库中保存会话令牌摘要。默认 Cookie 会话有效期 12 小时，可配置为 5 分钟至 30 天；登出撤销当前会话，不提供全端登出。登录失败按用户名和客户端 IP 做数据库限流，密码错误信息统一。跨源前端调用需要 `credentials: 'include'`，后端 `CORS_ALLOW_ORIGINS` 必须列出前端完整来源。`APP_ENV=production` 默认启用 Secure Cookie，生产必须使用 HTTPS。只有当前后端与前端处于跨站域名时，才设 `AUTH_COOKIE_SAMESITE=none`，并同时启用 Secure/HTTPS。`AUTH_ALLOW_REGISTRATION=false` 可关闭公开注册。
+
+React 已接入登录/注册页、刷新后登录态恢复和路由保护；认证状态以服务端 `/api/auth/me` 为准，顶部显示账号并提供退出登录。登录后的 `/getScenes` 每次签发独立 RTC 房间、RTC user_id 和短期 Token，避免多个用户共用场景文件里的固定 RTC 身份。Agent 会话创建、ASR WebSocket、LLM 轮次、打断和关闭接口要求 HttpOnly Cookie 登录态，且会校验会话所属账号。旧调试接口和 RTC OpenAPI 代理也要求登录；遗留 CustomLLM callback 使用单独 Bearer Key。RTC `user_id` 与账号 ID 分开保存和使用。账号/登录方案、网关认证对照及后续对话持久化计划见根目录《登录与账号体系设计.md》。
+
 ## 场景配置
 
 服务只读取 `python_server/scenes/*.json`。自有 Agent 场景按 `Custom.json.example` 配置：
@@ -58,7 +77,7 @@ uv sync
 uv run uvicorn app:app --host 0.0.0.0 --port 3001 --reload
 ```
 
-如果原 Node 服务正在运行，先停止它，避免占用相同的 `3001` 端口。迁移版 Agent API 目前还未接入前端；当前前端仍走旧流程。
+如果原 Node 服务正在运行，先停止它，避免占用相同的 `3001` 端口。前端开发服务器默认运行在 `3000`，首次访问会进入登录页；注册或登录后进入 RTC 页面。
 
 ## 测试
 
@@ -130,7 +149,7 @@ ARK_ASR_END_WINDOW_SIZE=800
 
 切换到网关时设置 `ASR_PROVIDER=gateway`，并将 `ASR_WS_URL`（或 `ASR_GATEWAY_WS_URL`）设为网关 WebSocket 地址；网关认证 Key 可选放在 `ASR_GATEWAY_API_KEY`。网关适配器按当前草案发送 `start` JSON、原始 PCM 二进制帧和 `end` JSON，并把 partial/final/error 归一化。实际接入前需与网关项目确认消息字段和鉴权方式；若网关最终契约不同，只需调整 `services/asr/client.py` 中网关适配器。修改 `.env` 后重启 Python 服务。前端到本项目的 WebSocket 路径和 RTC 音频格式不变，LLM/RAG/TTS 不受此选择影响。TTS V3 尚未接入。
 
-当前会话存储是单进程内存实现。RTC 本地音频帧会由浏览器转换为 16 kHz、16-bit、单声道 PCM，经本服务 ASR 适配器转发至选定上游；ASR 定稿文本交给 LLM 服务生成回复，RAG 提供可选检索上下文。ASR partial/final 事件沿后端 WebSocket 返回，LLM 文本增量通过 SSE 返回。它没有生产级用户鉴权、共享会话存储和跨实例路由，不能直接用于生产。
+账号和可撤销登录会话已存入 PostgreSQL；Agent 会话本身仍是单进程内存实现。RTC 本地音频帧会由浏览器转换为 16 kHz、16-bit、单声道 PCM，经本服务 ASR 适配器转发至选定上游；ASR 定稿文本交给 LLM 服务生成回复，RAG 提供可选检索上下文。ASR partial/final 事件沿后端 WebSocket 返回，LLM 文本增量通过 SSE 返回。多进程或多实例部署前仍需把 Agent 会话迁入共享存储并配置跨实例路由；当前登录限流由数据库共享，认证 Cookie 使用 HTTPS 安全配置。
 
 ## 本地 Agent 语音链路
 

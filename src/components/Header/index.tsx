@@ -3,10 +3,15 @@
  * SPDX-license-identifier: BSD-3-Clause
  */
 
-import { Button, Divider, Popover } from '@arco-design/web-react';
+import { Button, Divider, Message, Popover } from '@arco-design/web-react';
 import { IconMenu } from '@arco-design/web-react/icon';
+import { useNavigate } from 'react-router-dom';
+import { useSelector } from 'react-redux';
 import NetworkIndicator from '@/components/NetworkIndicator';
 import { useIsMobile } from '@/utils/utils';
+import { useAuth } from '@/auth/AuthContext';
+import { useLeave } from '@/lib/useCommon';
+import { RootState } from '@/store';
 import Logo from '@/assets/img/Logo.svg';
 import styles from './index.module.less';
 
@@ -21,6 +26,19 @@ interface HeaderProps {
 
 function Header(props: HeaderProps) {
   const { children, hide } = props;
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const leaveRoom = useLeave();
+  const isJoined = useSelector((state: RootState) => state.room.isJoined);
+  const handleLogout = async () => {
+    try {
+      if (isJoined) await leaveRoom();
+      await logout();
+      navigate('/login', { replace: true });
+    } catch {
+      Message.error('退出失败，请检查后端连接后重试');
+    }
+  };
 
   const MenuProps = [
     {
@@ -72,8 +90,22 @@ function Header(props: HeaderProps) {
         <NetworkIndicator />
       </div>
       {children}
-      {useIsMobile() ? null : (
+      {useIsMobile() ? (
+        user ? (
+          <Button type="text" size="mini" className={styles.mobileLogout} onClick={handleLogout}>
+            退出
+          </Button>
+        ) : null
+      ) : (
         <div className={styles['header-right']}>
+          {user && (
+            <>
+              <span className={styles.accountName}>{user.username}</span>
+              <Button type="text" className={styles['header-right-text']} onClick={handleLogout}>
+                退出登录
+              </Button>
+            </>
+          )}
           <div
             className={styles['header-right-text']}
             onClick={() =>

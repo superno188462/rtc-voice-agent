@@ -77,6 +77,7 @@ async function readLlmTurn(
     `${AIGC_PROXY_HOST}/api/agent/sessions/${sessionId}/turns`,
     {
       method: 'POST',
+      credentials: 'include',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text, turn_id: turnId }),
     }
@@ -185,6 +186,7 @@ export default function useMockAgent(): void {
       try {
         const response = await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions`, {
           method: 'POST',
+          credentials: 'include',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             scene_id: room.scene,
@@ -198,6 +200,7 @@ export default function useMockAgent(): void {
         if (cancelled) {
           await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions/${createdSessionId}`, {
             method: 'DELETE',
+            credentials: 'include',
           });
           return;
         }
@@ -423,6 +426,7 @@ export default function useMockAgent(): void {
       dispatch(updateASRPartialText(''));
       void fetch(`${AIGC_PROXY_HOST}/api/agent/sessions/${previousSessionId}`, {
         method: 'DELETE',
+        credentials: 'include',
       });
       dispatch(updateAIGCState({ isAIGCEnable: false }));
     }

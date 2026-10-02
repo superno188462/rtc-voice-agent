@@ -34,6 +34,7 @@ export const requestGetMethod = ({
       .map((key) => `${key}=${params[key]}`)
       .join('&')}`;
     const res = await fetch(url, {
+      credentials: 'include',
       headers: {
         ...headers,
       },
@@ -59,6 +60,7 @@ export const requestPostMethod = ({
   return async <T>(params: T) => {
     const res = await fetch(`${AIGC_PROXY_HOST}${apiPath}?Action=${action}`, {
       method: 'post',
+      credentials: 'include',
       headers: {
         'content-type': 'application/json',
         ...headers,

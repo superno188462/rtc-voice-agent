@@ -18,6 +18,7 @@ class AgentSession:
     scene_id: str
     room_id: str
     user_id: str
+    account_id: str
     gateway_profile_id: str = ""
     created_at: float = field(default_factory=time.time)
     messages: list[dict[str, str]] = field(default_factory=list)
@@ -33,13 +34,19 @@ class AgentService:
         self._lock = asyncio.Lock()
 
     async def create_session(
-        self, scene_id: str, room_id: str, user_id: str, gateway_profile_id: str = ""
+        self,
+        scene_id: str,
+        room_id: str,
+        user_id: str,
+        account_id: str,
+        gateway_profile_id: str = "",
     ) -> AgentSession:
         session = AgentSession(
             session_id=secrets.token_urlsafe(32),
             scene_id=scene_id,
             room_id=room_id,
             user_id=user_id,
+            account_id=account_id,
             gateway_profile_id=gateway_profile_id,
         )
         async with self._lock:

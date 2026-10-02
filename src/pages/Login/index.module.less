@@ -1,0 +1,99 @@
+.page {
+  min-height: 100vh;
+  overflow-y: auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+  background:
+    radial-gradient(circle at 15% 15%, rgba(97, 133, 255, 0.13), transparent 30%),
+    radial-gradient(circle at 85% 85%, rgba(151, 101, 255, 0.12), transparent 32%),
+    #f6f7fb;
+}
+
+.card {
+  width: min(100%, 420px);
+  box-sizing: border-box;
+  padding: 38px 36px 28px;
+  border: 1px solid rgba(36, 73, 150, 0.08);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 18px 60px rgba(25, 51, 105, 0.1);
+
+  h1 {
+    margin: 30px 0 8px;
+    color: #202b45;
+    font-size: 26px;
+    font-weight: 600;
+    text-align: center;
+  }
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #3158b7;
+  font-size: 16px;
+  font-weight: 600;
+
+  img {
+    width: 34px;
+    height: 28px;
+    object-fit: contain;
+  }
+}
+
+.subtitle {
+  margin: 0 0 28px;
+  color: #7b8499;
+  font-size: 14px;
+  text-align: center;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+
+  label {
+    margin-top: 6px;
+    color: #3e4960;
+    font-size: 14px;
+  }
+}
+
+.submit {
+  margin-top: 14px;
+  border-radius: 8px;
+}
+
+.error {
+  color: #d9304f;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.switchMode {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 18px;
+  color: #7b8499;
+  font-size: 14px;
+}
+
+.footer {
+  margin-top: 22px;
+  color: #9aa2b2;
+  font-size: 12px;
+}
+
+@media (max-width: 480px) {
+  .card {
+    padding: 32px 24px 22px;
+  }
+}

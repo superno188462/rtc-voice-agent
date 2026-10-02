@@ -17,8 +17,9 @@ from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -35,6 +36,18 @@ LOCAL_SCENES_DIR = BASE_DIR / "scenes"
 # 运行参数放在 python_server/.env；场景业务配置仍由 scenes/*.json 提供。
 load_dotenv(BASE_DIR / ".env")
 SCENES = read_files(LOCAL_SCENES_DIR, ".json")
+
+from services.auth.database import get_db_session, get_session_factory
+from services.auth.models import User
+from services.auth.service import (
+    LoginRateLimited,
+    create_auth_session,
+    get_user_by_token,
+    login_user,
+    register_user,
+    revoke_token,
+    session_ttl,
+)
 
 
 def configure_custom_llm_urls() -> None:
@@ -55,10 +68,17 @@ def configure_custom_llm_urls() -> None:
 configure_custom_llm_urls()
 
 app = FastAPI(title="RTC AIGC Python Server", version="1.0.0")
+configured_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=configured_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -76,8 +96,8 @@ class DebugRequest(BaseModel):
 
 class AgentSessionRequest(BaseModel):
     scene_id: str
-    room_id: str
-    user_id: str
+    room_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
 
 
 class AgentTurnRequest(BaseModel):
@@ -85,6 +105,139 @@ class AgentTurnRequest(BaseModel):
     turn_id: Optional[str] = Field(
         default=None, description="前端为单轮语音分配的追踪 ID，用于关联 ASR 与 LLM 耗时。"
     )
+
+
+class AuthCredentials(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+def _user_payload(user: User) -> dict[str, Any]:
+    return {"id": user.id, "username": user.username, "role": user.role, "permissions": []}
+
+
+def _validate_request_origin(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if origin and origin not in configured_origins:
+        raise HTTPException(status_code=403, detail={"code": "ORIGIN_NOT_ALLOWED"})
+
+
+def _cookie_security() -> tuple[bool, str]:
+    secure_setting = os.getenv("AUTH_COOKIE_SECURE")
+    secure = (
+        secure_setting.strip().lower() == "true"
+        if secure_setting is not None
+        else os.getenv("APP_ENV", "development").strip().lower() == "production"
+    )
+    same_site = os.getenv("AUTH_COOKIE_SAMESITE", "lax").strip().lower()
+    if same_site not in {"lax", "strict", "none"} or (same_site == "none" and not secure):
+        raise RuntimeError("AUTH_COOKIE_SAMESITE_NONE_REQUIRES_SECURE_COOKIE")
+    return secure, same_site
+
+
+async def require_current_user(
+    request: Request, db: AsyncSession = Depends(get_db_session)
+) -> User:
+    _validate_request_origin(request)
+    user = await get_user_by_token(db, request.cookies.get("rtc_agent_session"))
+    if not user:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
+    return user
+
+
+def _set_auth_cookie(response: JSONResponse, token: str) -> None:
+    secure, same_site = _cookie_security()
+    response.set_cookie(
+        key="rtc_agent_session",
+        value=token,
+        max_age=session_ttl(),
+        httponly=True,
+        secure=secure,
+        samesite=same_site,
+        # 登录还保护兼容路由 /getScenes、/proxy 和 /debug/chat。
+        path="/",
+    )
+
+
+@app.post("/api/auth/register", status_code=201)
+async def auth_register(
+    credentials: AuthCredentials,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> JSONResponse:
+    """本地账号注册。首版不依赖网关的认证或数据库。"""
+    from fastapi import HTTPException
+    from sqlalchemy.exc import IntegrityError
+
+    _validate_request_origin(request)
+    if os.getenv("AUTH_ALLOW_REGISTRATION", "true").strip().lower() != "true":
+        raise HTTPException(status_code=403, detail={"code": "REGISTRATION_DISABLED"})
+    try:
+        user = await register_user(db, credentials.username, credentials.password)
+    except ValueError as exc:
+        code = str(exc)
+        status = 409 if code == "USERNAME_TAKEN" else 422
+        raise HTTPException(status_code=status, detail={"code": code}) from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "USERNAME_TAKEN"}) from exc
+
+    token, _ = await create_auth_session(db, user)
+    response = JSONResponse({"user": _user_payload(user)}, status_code=201)
+    _set_auth_cookie(response, token)
+    return response
+
+
+@app.post("/api/auth/login")
+async def auth_login(
+    credentials: AuthCredentials,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> JSONResponse:
+    _validate_request_origin(request)
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        result = await login_user(db, credentials.username, credentials.password, client_ip)
+    except LoginRateLimited as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "LOGIN_RATE_LIMITED", "message": "登录尝试过于频繁，请稍后重试"},
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    except ValueError as exc:
+        # 避免通过不同响应枚举账号格式与存在性。
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS"}) from exc
+    if not result:
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS"})
+    user, token, _ = result
+    response = JSONResponse({"user": _user_payload(user)})
+    _set_auth_cookie(response, token)
+    return response
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: User = Depends(require_current_user)) -> dict[str, object]:
+    return {"user": _user_payload(user)}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(
+    request: Request, db: AsyncSession = Depends(get_db_session)
+) -> JSONResponse:
+    _validate_request_origin(request)
+    await revoke_token(db, request.cookies.get("rtc_agent_session"))
+    secure, same_site = _cookie_security()
+    response = JSONResponse({"logged_out": True})
+    response.delete_cookie(
+        "rtc_agent_session",
+        path="/",
+        httponly=True,
+        secure=secure,
+        samesite=same_site,
+    )
+    return response
 
 
 @app.websocket("/api/agent/sessions/{session_id}/asr")
@@ -98,6 +251,25 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
     session = await agent_service.get_session(session_id)
     if not session:
         await websocket.close(code=4404, reason="SESSION_NOT_FOUND")
+        return
+    origin = websocket.headers.get("origin")
+    if origin and origin not in configured_origins:
+        await websocket.close(code=4403, reason="ORIGIN_NOT_ALLOWED")
+        return
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            user = await get_user_by_token(
+                db, websocket.cookies.get("rtc_agent_session")
+            )
+    except Exception:
+        await websocket.close(code=1011, reason="AUTH_DATABASE_UNAVAILABLE")
+        return
+    if not user:
+        await websocket.close(code=4401, reason="AUTH_REQUIRED")
+        return
+    if session.account_id != user.id:
+        await websocket.close(code=4403, reason="SESSION_FORBIDDEN")
         return
     await websocket.accept()
     try:
@@ -208,12 +380,20 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
             pass
 
 
+def _session_is_owned(session, user: User) -> bool:
+    return bool(session and session.account_id == user.id)
+
+
 @app.post("/api/agent/sessions/{session_id}/mock-llm-turns")
-async def mock_llm_turn(session_id: str, request: AgentTurnRequest):
+async def mock_llm_turn(
+    session_id: str,
+    request: AgentTurnRequest,
+    user: User = Depends(require_current_user),
+):
     """接收真实 ASR 结果，流式返回固定 mock LLM 文本，不调用外部模型。"""
 
     session = await agent_service.get_session(session_id)
-    if not session:
+    if not _session_is_owned(session, user):
         return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
     if not request.text.strip():
         return JSONResponse({"error": {"code": "EMPTY_TEXT"}}, status_code=400)
@@ -236,20 +416,21 @@ async def mock_llm_turn(session_id: str, request: AgentTurnRequest):
 
 
 @app.post("/api/agent/sessions")
-async def create_agent_session(request: AgentSessionRequest) -> dict[str, Any]:
+async def create_agent_session(
+    request: AgentSessionRequest,
+    user: User = Depends(require_current_user),
+) -> dict[str, Any]:
     """创建自有 Agent 会话。媒体机器人尚未接入时，此接口只管理编排会话。"""
 
     scene = SCENES.get(request.scene_id)
     if not scene:
         return JSONResponse({"error": {"code": "SCENE_NOT_FOUND"}}, status_code=404)
-    rtc_config = scene.get("RTCConfig") or {}
-    if request.room_id != rtc_config.get("RoomId") or request.user_id != rtc_config.get("UserId"):
-        return JSONResponse({"error": {"code": "RTC_IDENTITY_MISMATCH"}}, status_code=403)
     agent_config = scene.get("AgentConfig") or {}
     session = await agent_service.create_session(
         request.scene_id,
         request.room_id,
         request.user_id,
+        user.id,
         agent_config.get("GatewayProfileId", ""),
     )
     return {
@@ -260,11 +441,15 @@ async def create_agent_session(request: AgentSessionRequest) -> dict[str, Any]:
 
 
 @app.post("/api/agent/sessions/{session_id}/turns")
-async def agent_turn(session_id: str, request: AgentTurnRequest):
+async def agent_turn(
+    session_id: str,
+    request: AgentTurnRequest,
+    user: User = Depends(require_current_user),
+):
     """提交 ASR 定稿文本并以 SSE 返回已配置 LLM 服务的生成增量。"""
 
     session = await agent_service.get_session(session_id)
-    if not session:
+    if not _session_is_owned(session, user):
         return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
     if not request.text.strip():
         return JSONResponse({"error": {"code": "EMPTY_TEXT"}}, status_code=400)
@@ -289,11 +474,14 @@ async def agent_turn(session_id: str, request: AgentTurnRequest):
 
 
 @app.post("/api/agent/sessions/{session_id}/mock-turns")
-async def mock_agent_turn(session_id: str):
+async def mock_agent_turn(
+    session_id: str,
+    user: User = Depends(require_current_user),
+):
     """模拟一次语音轮次：返回固定 ASR 识别文本及固定 LLM 回复，不调用外部模型。"""
 
     session = await agent_service.get_session(session_id)
-    if not session:
+    if not _session_is_owned(session, user):
         return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
 
     async def stream_response():
@@ -313,26 +501,37 @@ async def mock_agent_turn(session_id: str):
 
 
 @app.delete("/api/agent/sessions/{session_id}")
-async def close_agent_session(session_id: str) -> dict[str, bool]:
+async def close_agent_session(
+    session_id: str,
+    user: User = Depends(require_current_user),
+) -> dict[str, bool]:
+    session = await agent_service.get_session(session_id)
+    if not _session_is_owned(session, user):
+        return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
     return {"closed": await agent_service.close_session(session_id)}
 
 
 @app.post("/api/agent/sessions/{session_id}/interrupt")
-async def interrupt_agent_session(session_id: str) -> dict[str, bool]:
+async def interrupt_agent_session(
+    session_id: str,
+    user: User = Depends(require_current_user),
+) -> dict[str, bool]:
     session = await agent_service.get_session(session_id)
-    if not session:
+    if not _session_is_owned(session, user):
         return JSONResponse({"error": {"code": "SESSION_NOT_FOUND"}}, status_code=404)
     return {"interrupted": await agent_service.interrupt(session)}
 
 
 @app.post("/debug/chat")
-async def debug_chat(request: DebugRequest) -> dict[str, Any]:
+async def debug_chat(
+    request: DebugRequest,
+    user: User = Depends(require_current_user),
+) -> dict[str, Any]:
     """构造测试请求并直接调用正式 chat_callback，收集其 SSE 输出。"""
+    del user
     started_at = time.perf_counter()
     messages = [item.model_dump() for item in (request.history or [])]
     messages.append({"role": "user", "content": request.question})
-    print("[debug/chat] prompt:")
-    print(json.dumps(messages, ensure_ascii=False, indent=2))
     raw_body = json.dumps(
         {"messages": messages},
         ensure_ascii=False,
@@ -347,7 +546,17 @@ async def debug_chat(request: DebugRequest) -> dict[str, Any]:
         return {"type": "http.request", "body": raw_body, "more_body": False}
 
     internal_request = Request(
-        {"type": "http", "method": "POST", "path": "/api/chat_callback", "headers": []},
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/chat_callback",
+            "headers": [
+                (
+                    b"authorization",
+                    f"Bearer {os.getenv('CUSTOM_LLM_API_KEY', '')}".encode(),
+                )
+            ],
+        },
         receive,
     )
     response = await chat_callback(internal_request)
@@ -445,6 +654,16 @@ async def chat_callback(request: Request):
     `LLM_API_BASE`、`LLM_API_KEY`、`LLM_MODEL` 配置的 OpenAI 兼容服务。
     """
 
+    expected_api_key = os.getenv("CUSTOM_LLM_API_KEY", "").strip()
+    if not expected_api_key:
+        return JSONResponse({"error": {"code": "CALLBACK_NOT_CONFIGURED"}}, status_code=503)
+    authorization = request.headers.get("authorization", "")
+    scheme, _, provided_api_key = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        provided_api_key.strip(), expected_api_key
+    ):
+        return JSONResponse({"error": {"code": "UNAUTHORIZED"}}, status_code=401)
+
     callback_started = time.perf_counter()
     print(f"[trace][callback] request_received t={time.time():.3f}")
     try:
@@ -496,8 +715,10 @@ async def proxy(
     payload: dict[str, Any] = Body(default={}),
     Action: str | None = Query(None),
     Version: str = Query("2024-12-01"),
+    user: User = Depends(require_current_user),
 ) -> dict[str, Any]:
     """代理 AIGC VoiceChat OpenAPI 请求。"""
+    del user
 
     async def logic() -> dict[str, Any]:
         action = Action or ""
@@ -545,14 +766,14 @@ async def proxy(
 
 
 @app.post("/getScenes")
-async def get_scenes() -> dict[str, Any]:
-    """读取场景并返回前端所需的场景与 RTC 参数。"""
+async def get_scenes(user: User = Depends(require_current_user)) -> dict[str, Any]:
+    """读取场景并为该次登录后的页面访问签发独立 RTC 房间和身份。"""
 
     async def logic() -> dict[str, Any]:
         scenes: list[dict[str, Any]] = []
         for scene_id, json_data in SCENES.items():
             scene_config = json_data.get("SceneConfig") or {}
-            rtc_config = json_data.setdefault("RTCConfig", {})
+            rtc_config = json_data.get("RTCConfig") or {}
             # VoiceChat is optional and read only for backward compatibility with the demo.
             voice_chat = json_data.get("VoiceChat") or {}
             legacy_agent_config = voice_chat.get("AgentConfig") or {}
@@ -560,28 +781,19 @@ async def get_scenes() -> dict[str, Any]:
             media_config = json_data.get("MediaConfig") or {}
 
             app_id = rtc_config.get("AppId")
-            room_id = rtc_config.get("RoomId")
-            user_id = rtc_config.get("UserId")
-            token = rtc_config.get("Token")
             assert_value(app_id, f"{scene_id} 场景的 RTCConfig.AppId 不能为空")
-            if app_id and (not token or not user_id or not room_id):
-                room_id = room_id or str(uuid.uuid4())
-                user_id = user_id or str(uuid.uuid4())
-                rtc_config["RoomId"] = room_id
-                rtc_config["UserId"] = user_id
-                if voice_chat:
-                    voice_chat["RoomId"] = room_id
-                    target_users = legacy_agent_config.setdefault("TargetUserId", [""])
-                    if not target_users:
-                        target_users.append("")
-                    target_users[0] = user_id
-                app_key = rtc_config.get("AppKey")
-                assert_value(app_key, f"自动生成 Token 时, {scene_id} 场景的 AppKey 不可为空")
-                key = AccessToken(app_id, app_key, room_id, user_id)
-                key.add_privilege(Privileges.PrivSubscribeStream, 0)
-                key.add_privilege(Privileges.PrivPublishStream, 0)
-                key.expire_time(int(time.time()) + 24 * 3600)
-                rtc_config["Token"] = key.serialize()
+            app_key = rtc_config.get("AppKey")
+            assert_value(app_key, f"为登录用户签发 Token 时, {scene_id} 场景的 AppKey 不可为空")
+            room_id = str(uuid.uuid4())
+            user_id = str(uuid.uuid4())
+            key = AccessToken(app_id, app_key, room_id, user_id)
+            key.add_privilege(Privileges.PrivSubscribeStream, 0)
+            key.add_privilege(Privileges.PrivPublishStream, 0)
+            token_ttl = max(300, int(os.getenv("RTC_TOKEN_TTL_SECONDS", "3600")))
+            key.expire_time(int(time.time()) + token_ttl)
+            safe_rtc = dict(rtc_config)
+            safe_rtc.pop("AppKey", None)
+            safe_rtc.update({"RoomId": room_id, "UserId": user_id, "Token": key.serialize()})
 
             config = voice_chat.get("Config") or {}
             vision_config = (config.get("LLMConfig") or {}).get("VisionConfig") or {}
@@ -604,8 +816,6 @@ async def get_scenes() -> dict[str, Any]:
                 media_config.get("AvatarBackgroundUrl", avatar_config.get("BackgroundUrl", "")),
             )
 
-            safe_rtc = dict(rtc_config)
-            safe_rtc.pop("AppKey", None)
             scenes.append({"scene": dict(scene_config), "rtc": safe_rtc})
         return {"scenes": scenes}
 
