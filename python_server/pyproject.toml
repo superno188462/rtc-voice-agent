@@ -1,0 +1,15 @@
+[project]
+name = "rtc-aigc-python-server"
+version = "1.0.0"
+description = "Python implementation compatible with the rtc-aigc-demo Node server"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.0,<1.0.0",
+    "httpx>=0.28.0,<1.0.0",
+    "openai>=1.0.0,<2.0.0",
+    "python-dotenv>=1.1.0,<2.0.0",
+    "uvicorn[standard]>=0.35.0,<1.0.0",
+    "volcengine>=1.0.0",
+    "websockets>=15,<18",
+]

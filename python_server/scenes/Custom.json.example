@@ -1,0 +1,27 @@
+{
+  "SceneConfig": {
+    "icon": "",
+    "name": "自定义助手",
+    "isVision": false,
+    "isScreenMode": false,
+    "isInterruptMode": true,
+    "isAvatarScene": false,
+    "avatarBgUrl": ""
+  },
+  "RTCConfig": {
+    "AppId": "REPLACE_WITH_RTC_APP_ID",
+    "AppKey": "REPLACE_WITH_RTC_APP_KEY",
+    "RoomId": "",
+    "UserId": "",
+    "Token": ""
+  },
+  "AgentConfig": {
+    "BotUserId": "assistant",
+    "GatewayProfileId": "replace-with-gateway-profile-id",
+    "InterruptEnabled": true
+  },
+  "MediaConfig": {
+    "ASRProfileId": "replace-with-asr-profile-id",
+    "TTSProfileId": "replace-with-tts-profile-id"
+  }
+}
