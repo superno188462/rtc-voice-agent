@@ -163,7 +163,11 @@ class AgentService:
 
                 try:
                     extraction = await get_llm_service().extract_user_context(
-                        text, recent_user_messages, _profile, turn_id=resolved_turn_id
+                        text,
+                        recent_user_messages,
+                        _profile,
+                        current_long_term_memories=_memories,
+                        turn_id=resolved_turn_id,
                     )
                     persistence_stats, persistence_errors = await persist_extracted_context_updates(
                         gateway,
@@ -171,11 +175,13 @@ class AgentService:
                         extraction,
                         current_user_text=text,
                         recent_user_messages=recent_user_messages,
+                        current_long_term_memories=_memories,
                     )
                     print(
                         f"[agent][memory] persisted turn_id={resolved_turn_id} "
                         f"profile_updates={persistence_stats['profile_updates_written']} "
                         f"long_term_memories={persistence_stats['long_term_memories_written']} "
+                        f"long_term_memories_updated={persistence_stats['long_term_memories_updated']} "
                         f"profile_candidates={persistence_stats['profile_candidates']} "
                         f"profile_accepted={persistence_stats['profile_updates_accepted']} "
                         f"memory_candidates={persistence_stats['memory_candidates']} "
@@ -184,6 +190,7 @@ class AgentService:
                         f"memory_rejected_confidence={persistence_stats['memory_rejected_confidence']} "
                         f"memory_rejected_content={persistence_stats['memory_rejected_content']} "
                         f"memory_rejected_sensitive={persistence_stats['memory_rejected_sensitive']} "
+                        f"memory_rejected_reference={persistence_stats['memory_rejected_reference']} "
                         f"memory_duplicates={persistence_stats['memory_duplicates']} "
                         f"errors={','.join(persistence_errors) if persistence_errors else 'none'}"
                     )

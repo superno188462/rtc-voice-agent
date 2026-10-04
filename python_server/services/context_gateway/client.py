@@ -166,6 +166,28 @@ class ContextGatewayClient:
             json_body={"content": content, "tags": tags, "metadata": metadata},
         )
 
+    async def update_memory(
+        self,
+        external_user_id: str,
+        memory_id: str,
+        content: str,
+        tags: list[str],
+        metadata: dict[str, Any],
+        expected_version: int,
+    ) -> Any:
+        """Update one existing long-term memory using optimistic version control."""
+
+        return await self._request(
+            "PATCH",
+            f"/users/{quote(external_user_id, safe='')}/memories/{quote(memory_id, safe='')}",
+            json_body={
+                "content": content,
+                "tags": tags,
+                "metadata": metadata,
+                "expected_version": expected_version,
+            },
+        )
+
     async def get_profile(self, external_user_id: str) -> tuple[dict[str, Any], int | None]:
         """读取项目定义的当前用户画像及版本号。"""
 

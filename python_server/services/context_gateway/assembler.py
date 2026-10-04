@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+from datetime import datetime
 from typing import Any
 
 from services.context_gateway.client import ContextGatewayClient, ContextGatewayError
@@ -32,8 +33,15 @@ async def load_context(
         if not items or not _has_next_page(payload, page, max_pages):
             break
 
-    selected = select_relevant_memories(memories, current_text)
-    memory_text = "\n".join(f"- {item['content']}" for item in selected)
+    recent_context = " ".join(
+        message.get("content", "")
+        for message in history[-12:]
+        if message.get("role") == "user" and isinstance(message.get("content"), str)
+    )
+    selected = select_relevant_memories(memories, f"{recent_context} {current_text}")
+    memory_text = "\n".join(
+        f"- [{_memory_type(item)}] {item['content']}" for item in selected
+    )
     profile_text = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))[:4000]
     variables = {"profile": profile_text, "long_term_memories": memory_text}
     profile_is_template_variable = "{{profile}}" in template
@@ -63,6 +71,21 @@ def select_relevant_memories(
         return []
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, item in enumerate(memories):
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        valid_until = metadata.get("valid_until")
+        if isinstance(valid_until, str):
+            try:
+                expiry = datetime.fromisoformat(valid_until.replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    from datetime import timezone
+
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry <= datetime.now(expiry.tzinfo):
+                    continue
+            except ValueError:
+                # Malformed expiry metadata must not hide otherwise usable legacy entries.
+                pass
         content = item.get("content", "")
         tags = item.get("tags", [])
         searchable = content + " " + " ".join(tag for tag in tags if isinstance(tag, str))
@@ -71,6 +94,19 @@ def select_relevant_memories(
             ranked.append((overlap, -index, item))
     ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
     return [entry[2] for entry in ranked[:limit]]
+
+
+def _memory_type(item: dict[str, Any]) -> str:
+    """Return the explicit memory kind, treating old untyped entries as semantic."""
+
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    memory_type = metadata.get("memory_type", item.get("memory_type"))
+    return (
+        memory_type
+        if isinstance(memory_type, str) and memory_type in {"episodic", "semantic", "procedural"}
+        else "semantic"
+    )
 
 
 PROFILE_SCHEMA_VERSION = 1
@@ -84,6 +120,9 @@ PROFILE_LIST_FIELDS = {
 ALLOWED_MEMORY_TAGS = {"学习目标", "当前目标", "稳定背景", "项目经历", "其他"}
 _MEMORY_SENSITIVE_PATTERN = re.compile(
     r"(?i)(password|api[-_ ]?key|token|密码|密钥|身份证|身份证号|手机号|手机号码|银行卡|住址|家庭住址|病史|疾病|诊断|账户余额)"
+)
+_UNDERSPECIFIED_MEMORY_PATTERN = re.compile(
+    r"^(?:用户)?(?:当前|目前)?正在(?:备考|准备考试|复习|学习|练习)(?:中)?[。.!！]?$"
 )
 
 
@@ -144,6 +183,29 @@ def _evidence_is_user_sourced(evidence: Any, user_messages: list[str]) -> bool:
 
     quote = normalize(evidence)
     return bool(quote and any(quote in normalize(message) for message in user_messages))
+
+
+def _evidence_quotes_are_user_sourced(evidence: Any, user_messages: list[str]) -> bool:
+    """Require every quote supporting a multi-turn memory to occur in user text."""
+
+    return (
+        isinstance(evidence, list)
+        and 1 <= len(evidence) <= 4
+        and all(_evidence_is_user_sourced(quote, user_messages) for quote in evidence)
+    )
+
+
+def _provided_memory_ids(memories: list[dict[str, Any]] | None) -> set[str]:
+    """Collect IDs actually shown to the extractor, limiting which entries it may update."""
+
+    ids: set[str] = set()
+    for item in memories or []:
+        if not isinstance(item, dict):
+            continue
+        memory_id = item.get("id", item.get("memory_id", item.get("uuid")))
+        if isinstance(memory_id, str):
+            ids.add(memory_id)
+    return ids
 
 
 def _validated_profile_updates(
@@ -217,10 +279,12 @@ async def persist_extracted_context_updates(
     extraction: dict[str, Any],
     current_user_text: str,
     recent_user_messages: list[str],
+    current_long_term_memories: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, int], list[str]]:
     """校验证据、置信度与画像 schema 后，写入候选画像更新及长期记忆。"""
 
     evidence_messages = [*recent_user_messages[-6:], current_user_text]
+    visible_memory_ids = _provided_memory_ids(current_long_term_memories)
     try:
         min_confidence = max(
             0.5, min(1.0, float(os.getenv("AGENT_MEMORY_MIN_CONFIDENCE", "0.75")))
@@ -239,28 +303,81 @@ async def persist_extracted_context_updates(
             if not isinstance(item, dict):
                 rejected["content"] += 1
                 continue
-            if not _evidence_is_user_sourced(item.get("evidence"), evidence_messages):
+            if not _evidence_quotes_are_user_sourced(item.get("evidence"), evidence_messages):
                 rejected["evidence"] += 1
                 continue
             content = item.get("content")
+            memory_type = item.get("memory_type")
             try:
                 confidence = float(item.get("confidence", 0))
             except (TypeError, ValueError):
                 rejected["confidence"] += 1
                 continue
-            if not math.isfinite(confidence) or not min_confidence <= confidence <= 1:
+            if isinstance(item.get("confidence"), bool) or not math.isfinite(confidence) or not min_confidence <= confidence <= 1:
                 rejected["confidence"] += 1
+                continue
+            required_keys = {
+                "action", "memory_id", "memory_type", "content", "tags",
+                "occurred_at", "valid_until", "source", "confidence", "evidence",
+            }
+            if set(item) != required_keys:
+                rejected["content"] += 1
+                continue
+            occurred_at = item.get("occurred_at")
+            valid_until = item.get("valid_until")
+            action = item.get("action")
+            memory_id = item.get("memory_id")
+
+            def valid_datetime(value: Any) -> bool:
+                if value is None:
+                    return True
+                if not isinstance(value, str):
+                    return False
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return parsed.tzinfo is not None
+                except ValueError:
+                    return False
+
+            if (
+                not isinstance(memory_type, str)
+                or memory_type not in {"episodic", "semantic", "procedural"}
+                or not isinstance(action, str)
+                or action not in {"create", "update"}
+                or (action == "create" and memory_id is not None)
+                or (action == "update" and not isinstance(memory_id, str))
+                or item.get("source") != "conversation"
+                or not isinstance(item.get("tags"), list)
+                or len(item["tags"]) > 5
+                or any(not isinstance(tag, str) or tag not in ALLOWED_MEMORY_TAGS for tag in item["tags"])
+                or not valid_datetime(occurred_at)
+                or not valid_datetime(valid_until)
+                or not isinstance(item.get("evidence"), list)
+                or not 1 <= len(item["evidence"]) <= 4
+                or any(not isinstance(quote, str) or not 1 <= len(quote) <= 500 for quote in item["evidence"])
+            ):
+                rejected["content"] += 1
                 continue
             if not isinstance(content, str) or not 3 <= len(content.strip()) <= 300:
                 rejected["content"] += 1
                 continue
             content = content.strip()
-            if _is_sensitive(content) or _is_sensitive(item["evidence"]):
+            if _UNDERSPECIFIED_MEMORY_PATTERN.fullmatch(content):
+                rejected["content"] += 1
+                continue
+            if _is_sensitive(content) or any(_is_sensitive(quote) for quote in item["evidence"]):
                 rejected["sensitive"] += 1
                 continue
-            proposed_tags = _clean_string_list(item.get("tags"), limit=5, max_length=32)
-            tags = [tag for tag in proposed_tags if tag in ALLOWED_MEMORY_TAGS] or ["其他"]
-            memories.append({"content": content, "tags": tags, "confidence": min(1.0, confidence)})
+            memories.append({
+                "action": item["action"],
+                "memory_id": item["memory_id"],
+                "memory_type": memory_type,
+                "content": content,
+                "tags": item["tags"] or ["其他"],
+                "confidence": min(1.0, confidence),
+                "occurred_at": occurred_at,
+                "valid_until": valid_until,
+            })
 
     errors: list[str] = []
     applied_profile_updates = 0
@@ -283,11 +400,14 @@ async def persist_extracted_context_updates(
             errors.append(f"profile:{type(exc).__name__}")
 
     created_memories = 0
+    updated_memories = 0
     duplicate_memories = 0
+    rejected_memory_references = 0
     write_errors: list[str] = []
     if memories:
         try:
             existing: set[str] = set()
+            existing_by_id: dict[str, dict[str, Any]] = {}
             max_pages = min(20, max(1, int(os.getenv("GATEWAY_CONTEXT_MEMORY_MAX_PAGES", "5"))))
             for page in range(1, max_pages + 1):
                 payload = await client.get_memory_page(external_user_id, page, page_size=50)
@@ -297,6 +417,12 @@ async def persist_extracted_context_updates(
                     for item in entries
                     if isinstance(item, dict) and isinstance(item.get("content"), str)
                 )
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_id = entry.get("id", entry.get("memory_id", entry.get("uuid")))
+                    if isinstance(entry_id, str):
+                        existing_by_id[entry_id] = entry
                 if not entries or not _has_next_page(payload, page, max_pages):
                     break
         except Exception as exc:
@@ -306,18 +432,53 @@ async def persist_extracted_context_updates(
         else:
             for item in memories:
                 key = item["content"].casefold()
-                if key in existing:
+                if item["action"] == "create" and key in existing:
                     duplicate_memories += 1
                     continue
+                target: dict[str, Any] | None = None
+                expected_version: int | None = None
+                if item["action"] == "update":
+                    if item["memory_id"] not in visible_memory_ids:
+                        rejected_memory_references += 1
+                        continue
+                    target = existing_by_id.get(item["memory_id"])
+                    version_value = target.get("version", target.get("memory_version")) if target else None
+                    if target is None or not isinstance(version_value, int):
+                        rejected_memory_references += 1
+                        continue
+                    expected_version = version_value
+                    old_content = target.get("content")
+                    if isinstance(old_content, str) and old_content.strip().casefold() == key:
+                        duplicate_memories += 1
+                        continue
                 try:
-                    await client.create_memory(
-                        external_user_id,
-                        item["content"],
-                        [*item["tags"], "模型提取"],
-                        {"source": "llm_extraction", "confidence": item["confidence"], "schema_version": 1},
-                    )
+                    metadata = {
+                        "memory_type": item["memory_type"],
+                        "source": "llm_extraction",
+                        "confidence": item["confidence"],
+                        "occurred_at": item["occurred_at"],
+                        "valid_until": item["valid_until"],
+                        "schema_version": 2,
+                    }
+                    tags = [*item["tags"], "模型提取"]
+                    if item["action"] == "update":
+                        await client.update_memory(
+                            external_user_id,
+                            item["memory_id"],
+                            item["content"],
+                            tags,
+                            metadata,
+                            expected_version,
+                        )
+                        updated_memories += 1
+                        if isinstance(target, dict) and isinstance(target.get("content"), str):
+                            existing.discard(target["content"].strip().casefold())
+                    else:
+                        await client.create_memory(
+                            external_user_id, item["content"], tags, metadata
+                        )
+                        created_memories += 1
                     existing.add(key)
-                    created_memories += 1
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None)
                     suffix = f":{status_code}" if isinstance(status_code, int) else ""
@@ -333,8 +494,10 @@ async def persist_extracted_context_updates(
         "memory_rejected_confidence": rejected["confidence"],
         "memory_rejected_content": rejected["content"],
         "memory_rejected_sensitive": rejected["sensitive"],
+        "memory_rejected_reference": rejected_memory_references,
         "memory_duplicates": duplicate_memories,
         "long_term_memories_written": created_memories,
+        "long_term_memories_updated": updated_memories,
     }
     return stats, errors + write_errors
 
@@ -446,7 +609,7 @@ async def persist_explicit_preferences(
                 external_user_id,
                 memory,
                 ["用户明确记录"],
-                {"source": "explicit_user_request", "confidence": 1.0},
+                {"memory_type": "semantic", "source": "explicit_user_request", "confidence": 1.0, "schema_version": 2},
             )
 
     if not patch:

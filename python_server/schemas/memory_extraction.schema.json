@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rtc-voice-agent.local/schemas/memory_extraction.schema.json",
+  "title": "Agent Memory Extraction Result",
+  "description": "Structured output for independent profile and long-term-memory extraction.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "profile_updates": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "type": "string",
+            "enum": ["preferred_language", "response_style", "interests", "food_preferences.likes", "food_preferences.dislikes"]
+          },
+          "action": {"type": "string", "enum": ["set", "add", "remove"]},
+          "value": {"type": "string", "minLength": 1, "maxLength": 80},
+          "evidence": {"type": "string", "minLength": 1, "maxLength": 500},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "required": ["field", "action", "value", "evidence", "confidence"]
+      }
+    },
+    "long_term_memories": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {"$ref": "#/$defs/long_term_memory"}
+    }
+  },
+  "required": ["profile_updates", "long_term_memories"],
+  "$defs": {
+    "long_term_memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action": {"type": "string", "enum": ["create", "update"]},
+        "memory_id": {"type": ["string", "null"]},
+        "memory_type": {"type": "string", "enum": ["episodic", "semantic", "procedural"]},
+        "content": {"type": "string", "minLength": 3, "maxLength": 300},
+        "tags": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "string", "enum": ["学习目标", "当前目标", "稳定背景", "项目经历", "其他"]}
+        },
+        "occurred_at": {"type": ["string", "null"]},
+        "valid_until": {"type": ["string", "null"]},
+        "source": {"type": "string", "enum": ["conversation"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500}
+        }
+      },
+      "required": ["action", "memory_id", "memory_type", "content", "tags", "occurred_at", "valid_until", "source", "confidence", "evidence"]
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rtc-voice-agent.local/schemas/long_term_memory.schema.json",
+  "title": "Agent Long-Term Memory Candidate",
+  "description": "A single validated long-term memory candidate emitted by the memory extraction model.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["create", "update"],
+      "description": "Create a new entry or update a matching existing entry supplied in current_long_term_memories."
+    },
+    "memory_id": {
+      "type": ["string", "null"],
+      "description": "Existing memory ID for update; null for create."
+    },
+    "memory_type": {
+      "type": "string",
+      "enum": ["episodic", "semantic", "procedural"],
+      "description": "Information kind: a notable event, a stable fact/preference, or a reusable user-described procedure."
+    },
+    "content": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 300,
+      "description": "One concise, standalone memory statement."
+    },
+    "tags": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "enum": ["学习目标", "当前目标", "稳定背景", "项目经历", "其他"]
+      },
+      "description": "Controlled project tags used for coarse filtering."
+    },
+    "occurred_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "When the event happened; required for episodic memories and null otherwise."
+    },
+    "valid_until": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Optional expiry time for facts that can become stale."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["conversation"],
+      "description": "Evidence source for the candidate."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model confidence; the project applies its own write threshold."
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {"type": "string", "minLength": 1, "maxLength": 500},
+      "description": "One or more exact quotes copied from user messages; multiple quotes may jointly support a fact."
+    }
+  },
+  "required": [
+    "memory_type",
+    "action",
+    "memory_id",
+    "content",
+    "tags",
+    "occurred_at",
+    "valid_until",
+    "source",
+    "confidence",
+    "evidence"
+  ]
+}
