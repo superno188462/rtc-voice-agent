@@ -20,6 +20,21 @@
       "enum": ["episodic", "semantic", "procedural"],
       "description": "Information kind: a notable event, a stable fact/preference, or a reusable user-described procedure."
     },
+    "memory_role": {
+      "type": "string",
+      "enum": ["preference", "constraint", "fact", "event", "procedure"],
+      "description": "How the memory guides a response; active constraints take priority over preferences and plans."
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["global", "project"],
+      "description": "Whether this memory applies across the user's projects or only within one resolved project."
+    },
+    "project_name": {
+      "type": ["string", "null"],
+      "maxLength": 120,
+      "description": "A known project name or an explicit project name from user evidence; null for global memories. Never output a project ID."
+    },
     "content": {
       "type": "string",
       "minLength": 3,
@@ -34,11 +49,6 @@
         "enum": ["学习目标", "当前目标", "稳定背景", "项目经历", "其他"]
       },
       "description": "Controlled project tags used for coarse filtering."
-    },
-    "occurred_at": {
-      "type": ["string", "null"],
-      "format": "date-time",
-      "description": "When the event happened; required for episodic memories and null otherwise."
     },
     "valid_until": {
       "type": ["string", "null"],
@@ -69,8 +79,10 @@
     "action",
     "memory_id",
     "content",
+    "memory_role",
+    "scope",
+    "project_name",
     "tags",
-    "occurred_at",
     "valid_until",
     "source",
     "confidence",

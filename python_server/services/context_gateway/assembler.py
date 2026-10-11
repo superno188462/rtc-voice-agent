@@ -4,17 +4,94 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from services.context_gateway.client import ContextGatewayClient, ContextGatewayError
+from services.context_gateway.project_registry import (
+    normalize_project_name,
+    resolve_or_create_user_project,
+    resolve_project_ids,
+)
+from services.context_gateway.memory_vector_index import (
+    memory_vector_enabled,
+    search_user_memories,
+    sync_memory_entry,
+    sync_user_memories,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _memory_created_at() -> str:
+    """Return the program-generated UTC time at which a memory is written."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+async def _sync_memory_vector_best_effort(
+    user_id: str, saved_memory: Any
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Index a committed Context memory without turning an index outage into a write failure."""
+
+    if not memory_vector_enabled() or not isinstance(saved_memory, dict):
+        return None, None
+    try:
+        result = await sync_memory_entry(user_id, saved_memory)
+        return result, None
+    except Exception as exc:
+        error: dict[str, Any] = {"type": type(exc).__name__}
+        for attr, key in (
+            ("code", "code"),
+            ("upstream_code", "upstream_code"),
+            ("status_code", "http_status"),
+            ("gateway_trace_id", "gateway_trace_id"),
+            ("confirmed_ids", "confirmed_ids"),
+            ("uncertain_ids", "uncertain_ids"),
+        ):
+            value = getattr(exc, attr, None)
+            if value not in (None, [], ""):
+                error[key] = value
+        return None, error
+
+
+def _occurred_at_from_evidence(evidence: list[str]) -> str | None:
+    """Parse only explicit date expressions from user quotes; never infer an event time."""
+    text = " ".join(evidence)
+    patterns = (
+        r"(?<!\d)(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?!\d)",
+        r"(?<!\d)(\d{4})年(\d{1,2})月(\d{1,2})日(?!\d)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                event_date = date(*(int(part) for part in match.groups()))
+                return datetime.combine(
+                    event_date, datetime.min.time(), ZoneInfo("Asia/Shanghai")
+                ).isoformat()
+            except ValueError:
+                return None
+    relative_days = (("前天", 2), ("昨天", 1), ("今天", 0))
+    for token, days_ago in relative_days:
+        if token in text:
+            event_date = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=days_ago)
+            return datetime.combine(
+                event_date, datetime.min.time(), ZoneInfo("Asia/Shanghai")
+            ).isoformat()
+    return None
 
 
 async def load_context(
-    client: ContextGatewayClient, external_user_id: str, session_id: str, current_text: str
+    client: ContextGatewayClient,
+    external_user_id: str,
+    session_id: str,
+    current_text: str,
+    user_projects: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, str]], dict[str, Any], list[dict[str, Any]]]:
     """并行读取模板、画像、短期历史，再分页获取长期记忆并按问题筛选。"""
 
@@ -26,11 +103,16 @@ async def load_context(
     profile = normalize_user_profile(profile)
     memories: list[dict[str, Any]] = []
     max_pages = min(20, max(1, int(os.getenv("GATEWAY_CONTEXT_MEMORY_MAX_PAGES", "5"))))
+    listing_complete = True
     for page in range(1, max_pages + 1):
         payload = await client.get_memory_page(external_user_id, page, page_size=50)
         items = _memory_items(payload)
         memories.extend(item for item in items if isinstance(item, dict) and isinstance(item.get("content"), str))
-        if not items or not _has_next_page(payload, page, max_pages):
+        gateway_has_next = _has_next_page(payload, page, max_pages + 1)
+        has_next = _has_next_page(payload, page, max_pages)
+        if not items or not has_next:
+            if page == max_pages and gateway_has_next:
+                listing_complete = False
             break
 
     recent_context = " ".join(
@@ -38,19 +120,63 @@ async def load_context(
         for message in history[-12:]
         if message.get("role") == "user" and isinstance(message.get("content"), str)
     )
-    selected = select_relevant_memories(memories, f"{recent_context} {current_text}")
+    project_context = f"{recent_context} {current_text}"
+    active_project_ids = resolve_project_ids(
+        user_projects or [], current_text, recent_context
+    )
+    ranked_memory_ids: list[str] | None = None
+    if memory_vector_enabled():
+        try:
+            await sync_user_memories(
+                external_user_id, memories, listing_complete=listing_complete
+            )
+            query = " ".join(
+                [message.get("content", "") for message in history[-6:] if message.get("role") == "user"]
+                + [current_text]
+            )[-4000:]
+            hits = await search_user_memories(
+                external_user_id,
+                query,
+                active_project_ids=active_project_ids,
+                top_k=int(os.getenv("GATEWAY_MEMORY_TOP_K", "12")),
+            )
+            ranked_memory_ids = [hit["memory_id"] for hit in hits]
+        except Exception as exc:
+            # The Context API remains the source of truth; keyword filtering is a
+            # recoverable fallback while the separate vector service is unavailable.
+            logger.warning("memory_vector operation=retrieve error=%s", type(exc).__name__)
+    selected = select_relevant_memories(
+        memories,
+        project_context,
+        limit=min(40, max(1, int(os.getenv("GATEWAY_MEMORY_CONTEXT_LIMIT", "12")))),
+        active_project_ids=active_project_ids,
+        ranked_memory_ids=ranked_memory_ids,
+    )
+    active_project_names = [
+        project["name"]
+        for project in user_projects or []
+        if project.get("id") in active_project_ids and isinstance(project.get("name"), str)
+    ]
     memory_text = "\n".join(
-        f"- [{_memory_type(item)}] {item['content']}" for item in selected
+        f"- [{(item.get('metadata') if isinstance(item.get('metadata'), dict) else {}).get('scope', 'global')}:{(item.get('metadata') if isinstance(item.get('metadata'), dict) else {}).get('project_name') or '全局'}; "
+        f"{_memory_type(item)}/{_memory_role(item)}] {item['content']}"
+        for item in selected
     )
     profile_text = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))[:4000]
-    variables = {"profile": profile_text, "long_term_memories": memory_text}
+    variables = {
+        "profile": profile_text,
+        "long_term_memories": memory_text,
+        "active_project": "、".join(active_project_names),
+    }
     profile_is_template_variable = "{{profile}}" in template
     memories_are_template_variable = "{{long_term_memories}}" in template
     system_prompt = render_template(template, variables)
     if profile and not profile_is_template_variable:
         system_prompt += "\n\n当前用户画像（仅作背景信息）：\n" + profile_text
+    if active_project_names:
+        system_prompt += f"\n\n当前对话关联的用户项目：{'、'.join(active_project_names)}。仅将 project 范围记忆用于这些项目。"
     if memory_text and not memories_are_template_variable:
-        system_prompt += "\n\n与当前问题相关的长期记忆（仅作背景信息）：\n" + memory_text
+        system_prompt += "\n\n与当前问题相关的长期记忆（仅作背景信息；有效约束优先于偏好和当前计划）：\n" + memory_text
     return system_prompt, history[-50:], profile, selected
 
 
@@ -62,17 +188,28 @@ def render_template(template: str, variables: dict[str, str]) -> str:
 
 
 def select_relevant_memories(
-    memories: list[dict[str, Any]], query: str, limit: int = 4
+    memories: list[dict[str, Any]],
+    query: str,
+    limit: int = 12,
+    active_project_ids: list[str] | None = None,
+    ranked_memory_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """用轻量词项重叠筛选 Gateway 分页结果，不假设其提供语义检索。"""
+    """按 Gateway 向量排序筛选；未提供向量结果时回退到本地关键词重叠。"""
 
     query_terms = _terms(query)
-    if not query_terms:
-        return []
     ranked: list[tuple[int, int, dict[str, Any]]] = []
+    vector_rank = {memory_id: index for index, memory_id in enumerate(ranked_memory_ids or [])}
+    constraints: list[dict[str, Any]] = []
     for index, item in enumerate(memories):
         metadata = item.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
+        memory_scope = metadata.get("scope", "global")
+        if memory_scope == "project" and metadata.get("subject_project_id") not in (active_project_ids or []):
+            continue
+        if memory_scope not in {"global", "project"}:
+            continue
+        if metadata.get("status") in {"inactive", "superseded", "deleted"} or metadata.get("is_active") is False:
+            continue
         valid_until = metadata.get("valid_until")
         if isinstance(valid_until, str):
             try:
@@ -87,13 +224,57 @@ def select_relevant_memories(
                 # Malformed expiry metadata must not hide otherwise usable legacy entries.
                 pass
         content = item.get("content", "")
+        if _memory_role(item) == "constraint":
+            constraints.append(item)
+            continue
+        memory_id = _memory_id_for_context(item)
+        if ranked_memory_ids is not None:
+            if memory_id in vector_rank:
+                ranked.append((-vector_rank[memory_id], -index, item))
+            continue
         tags = item.get("tags", [])
         searchable = content + " " + " ".join(tag for tag in tags if isinstance(tag, str))
-        overlap = len(query_terms & _terms(searchable))
+        overlap = len(query_terms & _terms(searchable)) if query_terms else 0
         if overlap:
             ranked.append((overlap, -index, item))
     ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-    return [entry[2] for entry in ranked[:limit]]
+    # Always carry active constraints forward, even when their wording does not
+    # overlap with the user's current plan or question.
+    return constraints + [entry[2] for entry in ranked[:limit]]
+
+
+def _memory_id_for_context(item: dict[str, Any]) -> str | None:
+    value = item.get("id", item.get("memory_id", item.get("uuid")))
+    return value if isinstance(value, str) else None
+
+
+_CONSTRAINT_TEXT_PATTERN = re.compile(
+    r"(?:不能吃|不能使用|不能做|不得|不可以|避免|忌口|过敏|必须遵守|需遵守|应当遵守)"
+)
+
+
+def _scoped_memory_content_key(content: str, metadata: Any) -> str:
+    """Keep duplicate detection inside one global or project memory scope."""
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    scope = metadata.get("scope", "global")
+    project_id = metadata.get("subject_project_id", "") if scope == "project" else ""
+    return f"{scope}:{project_id}:{content.strip().casefold()}"
+
+
+def _memory_role(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    role = metadata.get("memory_role")
+    if role in {"preference", "constraint", "fact", "event", "procedure"}:
+        return role
+    tags = item.get("tags")
+    if isinstance(tags, list) and any(tag in {"饮食限制", "行为约束", "安全约束"} for tag in tags):
+        return "constraint"
+    content = item.get("content")
+    if isinstance(content, str) and _CONSTRAINT_TEXT_PATTERN.search(content):
+        return "constraint"
+    return "fact"
 
 
 def _memory_type(item: dict[str, Any]) -> str:
@@ -109,13 +290,10 @@ def _memory_type(item: dict[str, Any]) -> str:
     )
 
 
-PROFILE_SCHEMA_VERSION = 1
-PROFILE_LANGUAGE_VALUES = {"zh-CN", "en-US"}
-PROFILE_STYLE_VALUES = {"concise", "balanced", "detailed"}
-PROFILE_LIST_FIELDS = {
-    "interests": "interests",
-    "food_preferences.likes": "likes",
-    "food_preferences.dislikes": "dislikes",
+PROFILE_SCHEMA_VERSION = 4
+PROFILE_DOMAIN_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+PROFILE_RELATIONS = {
+    "likes", "dislikes", "prefers", "avoids", "proficient_in", "tends_to",
 }
 ALLOWED_MEMORY_TAGS = {"学习目标", "当前目标", "稳定背景", "项目经历", "其他"}
 _MEMORY_SENSITIVE_PATTERN = re.compile(
@@ -127,47 +305,65 @@ _UNDERSPECIFIED_MEMORY_PATTERN = re.compile(
 
 
 def normalize_user_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    """将网关画像限制为本项目定义的版本化字段，忽略未知字段和错误类型。"""
+    """规范化 v4 稳定特征，并将 v3 偏好记录迁移到兼容结构。"""
 
-    normalized: dict[str, Any] = {}
-    if profile.get("schema_version") == PROFILE_SCHEMA_VERSION:
-        normalized["schema_version"] = PROFILE_SCHEMA_VERSION
-    language = profile.get("preferred_language")
-    if isinstance(language, str) and language in PROFILE_LANGUAGE_VALUES:
-        normalized["preferred_language"] = language
-    style = profile.get("response_style")
-    if isinstance(style, str) and style in PROFILE_STYLE_VALUES:
-        normalized["response_style"] = style
-    interests = _clean_string_list(profile.get("interests"), limit=20, max_length=80)
-    if interests:
-        normalized["interests"] = interests
-    preferences = profile.get("food_preferences")
-    if isinstance(preferences, dict):
-        food_preferences = {
-            key: _clean_string_list(preferences.get(key), limit=20, max_length=80)
-            for key in ("likes", "dislikes")
-        }
-        if food_preferences["likes"] or food_preferences["dislikes"]:
-            normalized["food_preferences"] = food_preferences
+    normalized: dict[str, Any] = {"schema_version": PROFILE_SCHEMA_VERSION}
+    raw_traits = profile.get("traits")
+    raw_preferences = profile.get("preferences")
+    candidates: list[dict[str, Any]] = []
+    if isinstance(raw_traits, list):
+        candidates.extend(item for item in raw_traits[:100] if isinstance(item, dict))
+    elif isinstance(raw_preferences, list):
+        # Preserve existing v3 preferences during the schema upgrade.
+        for item in raw_preferences[:100]:
+            if not isinstance(item, dict):
+                continue
+            relation = {"like": "likes", "dislike": "dislikes", "prefer": "prefers", "avoid": "avoids"}.get(item.get("stance"))
+            if relation:
+                candidates.append({**item, "relation": relation})
+    if candidates:
+        traits: dict[tuple[str, str, str], dict[str, str | None]] = {}
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            domain = item.get("domain")
+            subject = item.get("subject")
+            relation = item.get("relation")
+            value = item.get("value")
+            if (
+                not isinstance(domain, str)
+                or not PROFILE_DOMAIN_PATTERN.fullmatch(domain.strip().lower())
+                or not isinstance(subject, str)
+                or not isinstance(relation, str)
+                or relation not in PROFILE_RELATIONS
+                or (value is not None and not isinstance(value, str))
+            ):
+                continue
+            domain = domain.strip().lower()
+            subject = subject.strip()[:120]
+            value = value.strip()[:120] if isinstance(value, str) else None
+            if not subject or _is_sensitive(subject) or (value and _is_sensitive(value)):
+                continue
+            key = _profile_trait_key(domain, subject, relation)
+            traits[key] = {
+                "domain": domain,
+                "relation": relation,
+                "subject": subject,
+                "value": value,
+            }
+        if traits:
+            normalized["traits"] = list(traits.values())
     return normalized
 
 
-def _clean_string_list(value: Any, limit: int, max_length: int) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            continue
-        item = item.strip()[:max_length]
-        key = item.casefold()
-        if item and key not in seen and not _is_sensitive(item):
-            seen.add(key)
-            result.append(item)
-        if len(result) >= limit:
-            break
-    return result
+def _profile_trait_key(domain: str, subject: str, relation: str) -> tuple[str, str, str]:
+    """同一对象的正反偏好视为可替换关系，其他特征按关系分别保存。"""
+    if relation in {"likes", "dislikes"}:
+        return "", subject.casefold(), "taste"
+    if relation in {"prefers", "avoids"}:
+        return "", subject.casefold(), "choice"
+    relation_group = relation
+    return domain, subject.casefold(), relation_group
 
 
 def _is_sensitive(value: str) -> bool:
@@ -210,67 +406,170 @@ def _provided_memory_ids(memories: list[dict[str, Any]] | None) -> set[str]:
 
 def _validated_profile_updates(
     candidates: Any, user_messages: list[str], min_confidence: float
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rejected = {"evidence": 0, "confidence": 0, "schema": 0, "sensitive": 0}
     if not isinstance(candidates, list):
-        return []
-    valid: list[dict[str, str]] = []
+        return [], rejected
+    valid: list[dict[str, Any]] = []
     for item in candidates[:10]:
-        if not isinstance(item, dict) or not _evidence_is_user_sourced(item.get("evidence"), user_messages):
+        if not isinstance(item, dict):
+            rejected["schema"] += 1
+            continue
+        if not _evidence_is_user_sourced(item.get("evidence"), user_messages):
+            rejected["evidence"] += 1
             continue
         try:
             confidence = float(item.get("confidence", 0))
         except (TypeError, ValueError):
+            rejected["confidence"] += 1
             continue
-        field = item.get("field")
         action = item.get("action")
+        domain = item.get("domain")
+        subject = item.get("subject")
+        relation = item.get("relation")
         value = item.get("value")
         if not math.isfinite(confidence) or not min_confidence <= confidence <= 1:
+            rejected["confidence"] += 1
             continue
-        if not isinstance(field, str) or not isinstance(action, str):
+        if not isinstance(action, str) or action not in {"upsert", "remove"}:
+            rejected["schema"] += 1
             continue
-        if not isinstance(value, str) or not value.strip():
+        if (
+            not isinstance(domain, str)
+            or not PROFILE_DOMAIN_PATTERN.fullmatch(domain.strip().lower())
+            or not isinstance(subject, str)
+            or not subject.strip()
+            or not isinstance(relation, str)
+            or relation not in PROFILE_RELATIONS
+            or (value is not None and not isinstance(value, str))
+        ):
+            rejected["schema"] += 1
             continue
-        value = value.strip()[:80]
-        if _is_sensitive(value):
+        domain = domain.strip().lower()
+        subject = subject.strip()[:120]
+        value = value.strip()[:120] if isinstance(value, str) else None
+        if _is_sensitive(subject) or (value and _is_sensitive(value)):
+            rejected["sensitive"] += 1
             continue
-        if field == "preferred_language" and action == "set" and value in PROFILE_LANGUAGE_VALUES:
-            valid.append({"field": field, "action": action, "value": value})
-        elif field == "response_style" and action == "set" and value in PROFILE_STYLE_VALUES:
-            valid.append({"field": field, "action": action, "value": value})
-        elif field in PROFILE_LIST_FIELDS and action in {"add", "remove"}:
-            valid.append({"field": field, "action": action, "value": value})
-    return valid
+        valid.append({
+            "action": action,
+            "domain": domain,
+            "relation": relation,
+            "subject": subject,
+            "value": value,
+        })
+    return valid, rejected
+
+
+def _known_profile_values(
+    profile: Any, updates: list[dict[str, Any]]
+) -> set[str]:
+    """Return values represented in the current profile or accepted this turn."""
+
+    values: set[str] = set()
+    normalized = normalize_user_profile(profile) if isinstance(profile, dict) else {}
+    traits = normalized.get("traits", [])
+    removed_keys: set[tuple[str, str, str]] = set()
+    for update in updates:
+        key = _profile_trait_key(update["domain"], update["subject"], update["relation"])
+        if update["action"] == "remove":
+            removed_keys.add(key)
+        else:
+            removed_keys.discard(key)
+    for trait in traits:
+        key = _profile_trait_key(trait["domain"], trait["subject"], trait["relation"])
+        if key in removed_keys:
+            continue
+        values.add(trait["subject"])
+        if trait.get("value"):
+            values.add(trait["value"])
+    for update in updates:
+        if update["action"] != "remove":
+            values.add(update["subject"])
+            if update.get("value"):
+                values.add(update["value"])
+    return {value.strip().casefold() for value in values if isinstance(value, str) and len(value.strip()) >= 2}
 
 
 def _apply_profile_updates(
-    profile: dict[str, Any], updates: list[dict[str, str]]
+    profile: dict[str, Any], updates: list[dict[str, Any]]
 ) -> dict[str, Any]:
     merged = normalize_user_profile(profile)
     merged["schema_version"] = PROFILE_SCHEMA_VERSION
     for update in updates:
-        field, action, value = update["field"], update["action"], update["value"]
-        if action == "set":
-            merged[field] = value
-            continue
-        if field == "interests":
-            values = list(merged.get("interests", []))
-            nested = None
+        key = _profile_trait_key(update["domain"], update["subject"], update["relation"])
+        traits = {
+            _profile_trait_key(item["domain"], item["subject"], item["relation"]): item
+            for item in merged.get("traits", [])
+        }
+        if update["action"] == "remove":
+            traits.pop(key, None)
         else:
-            nested_key, value_key = field.split(".", 1)
-            nested = dict(merged.get(nested_key, {}))
-            values = list(nested.get(value_key, []))
-        existing = {entry.casefold(): entry for entry in values}
-        if action == "remove":
-            existing.pop(value.casefold(), None)
-        elif len(existing) < 20:
-            existing.setdefault(value.casefold(), value)
-        result = list(existing.values())
-        if nested is None:
-            merged[field] = result
+            traits[key] = {
+                "domain": update["domain"],
+                "relation": update["relation"],
+                "subject": update["subject"],
+                "value": update.get("value"),
+            }
+        if traits:
+            merged["traits"] = list(traits.values())
         else:
-            nested[value_key] = result
-            merged[nested_key] = nested
+            merged.pop("traits", None)
     return merged
+
+
+_PROFILE_PREFERENCE_LANGUAGE = re.compile(
+    r"(?:喜欢|喜爱|偏好|爱吃|爱喝|好吃|好喝|最爱|不喜欢|不感兴趣|感兴趣|不爱吃|讨厌|更喜欢|更倾向|擅长|精通|倾向于)"
+)
+
+
+def _extract_explicit_profile_updates(messages: list[str]) -> list[dict[str, Any]]:
+    """从明确、非临时的用户自述提取候选；最终仍经过统一证据和隐私校验。"""
+    updates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    temporary = re.compile(r"(?:今天|这次|这回|暂时|目前|最近|现在|刚才)")
+    patterns = (
+        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:不喜欢|不爱吃|不爱喝|讨厌)(?:吃|喝)?(.+)$"), "dislikes", "topic"),
+        (re.compile(r"^(?:我)?对(.+?)不感兴趣$"), "dislikes", "topic"),
+        (re.compile(r"^(?:我)?(?:喜欢|偏好)(?:回答|回复)(.+)$"), "prefers", "communication"),
+        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:喜欢|喜爱|爱吃|爱喝)(?:吃|喝)(.+)$"), "likes", "food"),
+        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:喜欢|喜爱)(.+)$"), "likes", "topic"),
+        (re.compile(r"^(?:我)?(?:擅长|精通|熟悉)(.+)$"), "proficient_in", "skill"),
+        (re.compile(r"^(?:我)?(?:(?:做事|做决定|决策)时)?(?:(?:通常|一般|一向))?(.*?)倾向于(.+)$"), "tends_to", "decision_style"),
+    )
+    for original in messages:
+        if not isinstance(original, str):
+            continue
+        text = re.sub(r"^[\s，,。.!！?？]+|[\s，,。.!！?？]+$", "", original.strip())
+        if not text or temporary.search(text):
+            continue
+        for pattern, relation, domain in patterns:
+            match = pattern.fullmatch(text)
+            if not match:
+                continue
+            if relation == "tends_to":
+                subject = match.group(1).strip() or "做事方式"
+                value = match.group(2).strip()
+            elif relation == "prefers" and domain == "communication":
+                subject = "回答风格"
+                value = match.group(1).strip()
+            else:
+                subject = match.group(1).strip()
+                value = None
+            subject = re.sub(r"[，,。.!！?？]+$", "", subject).strip()
+            if not subject or len(subject) > 120 or _is_sensitive(subject) or (value and _is_sensitive(value)):
+                break
+            candidate = {
+                "action": "upsert",
+                "domain": domain,
+                "relation": relation,
+                "subject": subject[:120],
+                "value": value[:120] if value else None,
+                "evidence": original,
+                "confidence": 1.0,
+            }
+            updates[_profile_trait_key(domain, subject, relation)] = candidate
+            break
+    return list(updates.values())
 
 
 async def persist_extracted_context_updates(
@@ -280,7 +579,9 @@ async def persist_extracted_context_updates(
     current_user_text: str,
     recent_user_messages: list[str],
     current_long_term_memories: list[dict[str, Any]] | None = None,
-) -> tuple[dict[str, int], list[str]]:
+    user_projects: list[dict[str, Any]] | None = None,
+    current_profile: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     """校验证据、置信度与画像 schema 后，写入候选画像更新及长期记忆。"""
 
     evidence_messages = [*recent_user_messages[-6:], current_user_text]
@@ -292,12 +593,30 @@ async def persist_extracted_context_updates(
     except ValueError:
         min_confidence = 0.75
     raw_profile_updates = extraction.get("profile_updates")
-    profile_updates = _validated_profile_updates(
+    if not isinstance(raw_profile_updates, list):
+        raw_profile_updates = []
+    # Deterministic fallback for clear first-person traits avoids depending on
+    # the extractor to recognize every simple preference or capability.
+    explicit_updates = _extract_explicit_profile_updates([current_user_text])
+    if explicit_updates:
+        by_key = {
+            _profile_trait_key(item["domain"], item["subject"], item["relation"]): item
+            for item in raw_profile_updates
+            if isinstance(item, dict)
+            and isinstance(item.get("domain"), str)
+            and isinstance(item.get("subject"), str)
+            and isinstance(item.get("relation"), str)
+        }
+        for item in explicit_updates:
+            by_key[_profile_trait_key(item["domain"], item["subject"], item["relation"])] = item
+        raw_profile_updates = list(by_key.values())
+    profile_updates, profile_rejected = _validated_profile_updates(
         raw_profile_updates, evidence_messages, min_confidence=min_confidence
     )
+    known_profile_values = _known_profile_values(current_profile, profile_updates)
     raw_memories = extraction.get("long_term_memories")
     memories: list[dict[str, Any]] = []
-    rejected = {"evidence": 0, "confidence": 0, "content": 0, "sensitive": 0}
+    rejected = {"evidence": 0, "confidence": 0, "content": 0, "sensitive": 0, "profile_overlap": 0}
     if isinstance(raw_memories, list):
         for item in raw_memories[:5]:
             if not isinstance(item, dict):
@@ -308,6 +627,9 @@ async def persist_extracted_context_updates(
                 continue
             content = item.get("content")
             memory_type = item.get("memory_type")
+            memory_role = item.get("memory_role")
+            scope = item.get("scope")
+            project_name = item.get("project_name")
             try:
                 confidence = float(item.get("confidence", 0))
             except (TypeError, ValueError):
@@ -317,13 +639,12 @@ async def persist_extracted_context_updates(
                 rejected["confidence"] += 1
                 continue
             required_keys = {
-                "action", "memory_id", "memory_type", "content", "tags",
-                "occurred_at", "valid_until", "source", "confidence", "evidence",
+                "action", "memory_id", "memory_type", "memory_role", "scope", "project_name", "content", "tags",
+                "valid_until", "source", "confidence", "evidence",
             }
             if set(item) != required_keys:
                 rejected["content"] += 1
                 continue
-            occurred_at = item.get("occurred_at")
             valid_until = item.get("valid_until")
             action = item.get("action")
             memory_id = item.get("memory_id")
@@ -342,6 +663,12 @@ async def persist_extracted_context_updates(
             if (
                 not isinstance(memory_type, str)
                 or memory_type not in {"episodic", "semantic", "procedural"}
+                or not isinstance(memory_role, str)
+                or memory_role not in {"preference", "constraint", "fact", "event", "procedure"}
+                or scope not in {"global", "project"}
+                or (scope == "global" and project_name is not None)
+                or (scope == "project" and (not isinstance(project_name, str) or not project_name.strip()))
+                or (isinstance(project_name, str) and len(project_name.strip()) > 120)
                 or not isinstance(action, str)
                 or action not in {"create", "update"}
                 or (action == "create" and memory_id is not None)
@@ -350,7 +677,6 @@ async def persist_extracted_context_updates(
                 or not isinstance(item.get("tags"), list)
                 or len(item["tags"]) > 5
                 or any(not isinstance(tag, str) or tag not in ALLOWED_MEMORY_TAGS for tag in item["tags"])
-                or not valid_datetime(occurred_at)
                 or not valid_datetime(valid_until)
                 or not isinstance(item.get("evidence"), list)
                 or not 1 <= len(item["evidence"]) <= 4
@@ -358,6 +684,20 @@ async def persist_extracted_context_updates(
             ):
                 rejected["content"] += 1
                 continue
+            if scope == "project":
+                candidate_name = normalize_project_name(project_name)
+                known_names = {
+                    normalize_project_name(name)
+                    for project in user_projects or []
+                    for name in [project.get("name"), *(project.get("aliases") or [])]
+                    if isinstance(name, str)
+                }
+                user_text = " ".join(evidence_messages)
+                # Existing aliases may be selected from context; a new project
+                # may only be registered when its name appears in user text.
+                if candidate_name not in known_names and candidate_name not in normalize_project_name(user_text):
+                    rejected["content"] += 1
+                    continue
             if not isinstance(content, str) or not 3 <= len(content.strip()) <= 300:
                 rejected["content"] += 1
                 continue
@@ -368,14 +708,31 @@ async def persist_extracted_context_updates(
             if _is_sensitive(content) or any(_is_sensitive(quote) for quote in item["evidence"]):
                 rejected["sensitive"] += 1
                 continue
+            if (
+                scope == "global"
+                and (
+                    memory_role == "preference"
+                    or _PROFILE_PREFERENCE_LANGUAGE.search(content)
+                )
+                and any(value in content.casefold() for value in known_profile_values)
+            ):
+                rejected["profile_overlap"] += 1
+                continue
             memories.append({
                 "action": item["action"],
                 "memory_id": item["memory_id"],
                 "memory_type": memory_type,
+                "memory_role": memory_role,
+                "scope": scope,
+                "project_name": project_name.strip() if isinstance(project_name, str) else None,
                 "content": content,
                 "tags": item["tags"] or ["其他"],
                 "confidence": min(1.0, confidence),
-                "occurred_at": occurred_at,
+                "occurred_at": (
+                    _occurred_at_from_evidence(item["evidence"])
+                    if memory_type == "episodic"
+                    else None
+                ),
                 "valid_until": valid_until,
             })
 
@@ -404,6 +761,7 @@ async def persist_extracted_context_updates(
     duplicate_memories = 0
     rejected_memory_references = 0
     write_errors: list[str] = []
+    memory_vector_sync_results: list[dict[str, Any]] = []
     if memories:
         try:
             existing: set[str] = set()
@@ -413,7 +771,7 @@ async def persist_extracted_context_updates(
                 payload = await client.get_memory_page(external_user_id, page, page_size=50)
                 entries = _memory_items(payload)
                 existing.update(
-                    item["content"].strip().casefold()
+                    _scoped_memory_content_key(item["content"], item.get("metadata"))
                     for item in entries
                     if isinstance(item, dict) and isinstance(item.get("content"), str)
                 )
@@ -432,11 +790,27 @@ async def persist_extracted_context_updates(
         else:
             for item in memories:
                 key = item["content"].casefold()
-                if item["action"] == "create" and key in existing:
-                    duplicate_memories += 1
-                    continue
                 target: dict[str, Any] | None = None
                 expected_version: int | None = None
+                project: dict[str, Any] | None = None
+                if item["scope"] == "project":
+                    try:
+                        project = await resolve_or_create_user_project(
+                            external_user_id, item["project_name"]
+                        )
+                    except Exception as exc:
+                        write_errors.append(f"project_resolve:{type(exc).__name__}")
+                        continue
+                scope_key = _scoped_memory_content_key(
+                    item["content"],
+                    {
+                        "scope": item["scope"],
+                        "subject_project_id": project["id"] if project else None,
+                    },
+                )
+                if item["action"] == "create" and scope_key in existing:
+                    duplicate_memories += 1
+                    continue
                 if item["action"] == "update":
                     if item["memory_id"] not in visible_memory_ids:
                         rejected_memory_references += 1
@@ -448,21 +822,43 @@ async def persist_extracted_context_updates(
                         continue
                     expected_version = version_value
                     old_content = target.get("content")
-                    if isinstance(old_content, str) and old_content.strip().casefold() == key:
+                    old_metadata = target.get("metadata")
+                    if not isinstance(old_metadata, dict):
+                        old_metadata = target.get("metadata_json")
+                    if not isinstance(old_metadata, dict):
+                        old_metadata = {}
+                    if (
+                        isinstance(old_content, str)
+                        and old_content.strip().casefold() == key
+                        and _scoped_memory_content_key(old_content, old_metadata) == scope_key
+                        and old_metadata.get("memory_role") == item["memory_role"]
+                    ):
                         duplicate_memories += 1
                         continue
                 try:
                     metadata = {
                         "memory_type": item["memory_type"],
+                        "memory_role": item["memory_role"],
                         "source": "llm_extraction",
                         "confidence": item["confidence"],
-                        "occurred_at": item["occurred_at"],
                         "valid_until": item["valid_until"],
-                        "schema_version": 2,
+                        "schema_version": 3,
+                        "scope": item["scope"],
+                        "subject_project_id": project["id"] if project else None,
+                        "project_name": project["name"] if project else None,
                     }
                     tags = [*item["tags"], "模型提取"]
                     if item["action"] == "update":
-                        await client.update_memory(
+                        old_metadata = target.get("metadata") if isinstance(target, dict) else None
+                        if not isinstance(old_metadata, dict):
+                            old_metadata = target.get("metadata_json") if isinstance(target, dict) else None
+                        metadata = {**(old_metadata if isinstance(old_metadata, dict) else {}), **metadata}
+                        if item["occurred_at"] is not None:
+                            metadata["occurred_at"] = item["occurred_at"]
+                        else:
+                            metadata.setdefault("occurred_at", None)
+                        metadata["updated_at"] = _memory_created_at()
+                        saved_memory = await client.update_memory(
                             external_user_id,
                             item["memory_id"],
                             item["content"],
@@ -471,14 +867,45 @@ async def persist_extracted_context_updates(
                             expected_version,
                         )
                         updated_memories += 1
+                        vector_result, vector_error = await _sync_memory_vector_best_effort(
+                            external_user_id, saved_memory
+                        )
+                        memory_vector_sync_results.append({
+                            "action": "update",
+                            "memory_id": saved_memory.get("id", item["memory_id"]),
+                            "status": "failed" if vector_error else ("synced" if vector_result else "skipped"),
+                            "gateway_response": vector_result,
+                            "error": vector_error,
+                        })
+                        if vector_error:
+                            write_errors.append(f"memory_vector_sync:{vector_error.get('code') or vector_error['type']}")
                         if isinstance(target, dict) and isinstance(target.get("content"), str):
-                            existing.discard(target["content"].strip().casefold())
+                            existing.discard(
+                                _scoped_memory_content_key(
+                                    target["content"], target.get("metadata")
+                                )
+                            )
                     else:
-                        await client.create_memory(
+                        metadata["occurred_at"] = item["occurred_at"]
+                        metadata["created_at"] = _memory_created_at()
+                        saved_memory = await client.create_memory(
                             external_user_id, item["content"], tags, metadata
                         )
                         created_memories += 1
-                    existing.add(key)
+                        vector_result, vector_error = await _sync_memory_vector_best_effort(
+                            external_user_id, saved_memory
+                        )
+                        memory_vector_sync_results.append({
+                            "action": "create",
+                            "memory_id": saved_memory.get("id"),
+                            "content": item["content"],
+                            "status": "failed" if vector_error else ("synced" if vector_result else "skipped"),
+                            "gateway_response": vector_result,
+                            "error": vector_error,
+                        })
+                        if vector_error:
+                            write_errors.append(f"memory_vector_sync:{vector_error.get('code') or vector_error['type']}")
+                    existing.add(scope_key)
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None)
                     suffix = f":{status_code}" if isinstance(status_code, int) else ""
@@ -486,18 +913,37 @@ async def persist_extracted_context_updates(
     accepted_memory_count = len(memories)
     stats = {
         "profile_candidates": len(raw_profile_updates) if isinstance(raw_profile_updates, list) else 0,
+        "profile_rule_candidates": explicit_updates,
         "profile_updates_accepted": len(profile_updates),
         "profile_updates_written": applied_profile_updates,
+        "profile_rejected_evidence": profile_rejected["evidence"],
+        "profile_rejected_confidence": profile_rejected["confidence"],
+        "profile_rejected_schema": profile_rejected["schema"],
+        "profile_rejected_sensitive": profile_rejected["sensitive"],
         "memory_candidates": len(raw_memories) if isinstance(raw_memories, list) else 0,
         "memory_candidates_accepted": accepted_memory_count,
         "memory_rejected_evidence": rejected["evidence"],
         "memory_rejected_confidence": rejected["confidence"],
         "memory_rejected_content": rejected["content"],
         "memory_rejected_sensitive": rejected["sensitive"],
+        "memory_rejected_profile_overlap": rejected["profile_overlap"],
         "memory_rejected_reference": rejected_memory_references,
         "memory_duplicates": duplicate_memories,
         "long_term_memories_written": created_memories,
         "long_term_memories_updated": updated_memories,
+        "memory_vector_sync_results": memory_vector_sync_results,
+        "validated_memories": [
+            {
+                "action": item["action"],
+                "memory_type": item["memory_type"],
+                "memory_role": item["memory_role"],
+                "scope": item["scope"],
+                "content": item["content"],
+                "tags": item["tags"],
+            }
+            for item in memories
+        ],
+        "validated_profile_updates": profile_updates,
     }
     return stats, errors + write_errors
 
@@ -518,19 +964,19 @@ def explicit_memory_request(text: str) -> str | None:
 
 
 def explicit_profile_patch(text: str) -> dict[str, Any]:
-    """仅从明确、稳定的表达偏好语句提取当前项目画像字段。"""
+    """从明确要求长期应用的沟通偏好构造 v4 traits 补丁。"""
 
     value = text.strip()
     if not re.search(r"(?:以后|今后|请一直|默认)", value):
         return {}
-    patch: dict[str, Any] = {}
+    traits: list[dict[str, str | None]] = []
     if re.search(r"中文.{0,8}(?:回答|回复)|(?:用|使用|请用|请使用)中文回答|偏好中文", value):
-        patch["preferred_language"] = "zh-CN"
+        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_language", "value": "中文"})
     elif re.search(r"英文.{0,8}(?:回答|回复)|(?:用|使用|请用|请使用)英文回答|偏好英文", value):
-        patch["preferred_language"] = "en-US"
+        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_language", "value": "英文"})
     if re.search(r"(?:简洁|简短|精炼).{0,12}(?:回答|回复)|(?:回答|回复).{0,12}(?:简洁|简短|精炼)", value):
-        patch["response_style"] = "concise"
-    return patch
+        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_style", "value": "简洁"})
+    return {"schema_version": PROFILE_SCHEMA_VERSION, "traits": traits} if traits else {}
 
 
 def message_pair_hash(messages: list[dict[str, str]]) -> str:
@@ -605,12 +1051,29 @@ async def persist_explicit_preferences(
             if not entries or not _has_next_page(payload, page, max_pages):
                 break
         if not already_saved:
-            await client.create_memory(
+            saved_memory = await client.create_memory(
                 external_user_id,
                 memory,
                 ["用户明确记录"],
-                {"memory_type": "semantic", "source": "explicit_user_request", "confidence": 1.0, "schema_version": 2},
+                {
+                    "memory_type": "semantic",
+                    "source": "explicit_user_request",
+                    "confidence": 1.0,
+                    "memory_role": "constraint" if _memory_role({"content": memory}) == "constraint" else "fact",
+                    "schema_version": 3,
+                    "occurred_at": None,
+                    "created_at": _memory_created_at(),
+                },
             )
+            _vector_result, vector_error = await _sync_memory_vector_best_effort(
+                external_user_id, saved_memory
+            )
+            if vector_error:
+                logger.warning(
+                    "memory_vector_sync_failed code=%s status=%s",
+                    vector_error.get("code", vector_error.get("type")),
+                    vector_error.get("http_status", "unavailable"),
+                )
 
     if not patch:
         return
@@ -618,7 +1081,11 @@ async def persist_explicit_preferences(
     if not profile:
         version = None
     for attempt in range(2):
-        merged = {**profile, **patch}
+        updates = [
+            {"action": "upsert", **trait}
+            for trait in patch.get("traits", [])
+        ]
+        merged = _apply_profile_updates(profile, updates)
         try:
             await client.put_profile(external_user_id, merged, version)
             return

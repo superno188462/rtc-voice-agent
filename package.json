@@ -16,7 +16,7 @@
     "uuid": "^8.3.2"
   },
   "scripts": {
-    "dev": "npm run echo && npm run start",
+    "dev": "cross-env REACT_APP_LOCAL=cn craco start",
     "start": "cross-env REACT_APP_LOCAL=cn  craco start",
     "server:start": "node Server/app.js",
     "build": "craco build",

@@ -8,6 +8,7 @@ import { AuthProvider, useAuth } from './auth/AuthContext';
 import RequireAuth from './auth/RequireAuth';
 import AuthLoading from './auth/AuthLoading';
 import MainPage from './pages/MainPage';
+import RetrievalTestPage from './pages/RetrievalTest';
 import LoginPage from './pages/Login';
 import '@arco-design/web-react/dist/css/arco.css';
 
@@ -26,6 +27,15 @@ function AppRoutes() {
           </RequireAuth>
         }
       />
+      <Route
+        path="/retrieval-test"
+        element={
+          <RequireAuth>
+            <RetrievalTestPage />
+          </RequireAuth>
+        }
+      />
+      <Route path="/knowledge-base" element={<Navigate to="/retrieval-test" replace />} />
       <Route path="*" element={<Navigate to={user ? '/' : '/login'} replace />} />
     </Routes>
   );

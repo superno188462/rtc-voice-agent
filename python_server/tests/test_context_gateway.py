@@ -8,6 +8,7 @@ import unittest
 import httpx
 
 from services.context_gateway.assembler import (
+    _validated_profile_updates,
     explicit_memory_request,
     load_context,
     persist_explicit_preferences,
@@ -22,6 +23,43 @@ class ContextGatewayTests(unittest.IsolatedAsyncioTestCase):
             "test-project-key-do-not-log",
             transport=httpx.MockTransport(handler),
         )
+
+    def test_explicit_food_preference_is_accepted_as_profile_update(self) -> None:
+        updates, rejected = _validated_profile_updates(
+            [
+                {
+                    "field": "food_preferences.likes",
+                    "action": "add",
+                    "value": "草莓",
+                    "evidence": "我喜欢吃草莓",
+                    "confidence": 0.95,
+                }
+            ],
+            ["我喜欢吃草莓"],
+            min_confidence=0.75,
+        )
+        self.assertEqual(
+            updates,
+            [{"field": "food_preferences.likes", "action": "add", "value": "草莓"}],
+        )
+        self.assertEqual(sum(rejected.values()), 0)
+
+    def test_list_profile_set_action_is_normalized_to_add(self) -> None:
+        updates, rejected = _validated_profile_updates(
+            [
+                {
+                    "field": "food_preferences.likes",
+                    "action": "set",
+                    "value": "草莓",
+                    "evidence": "我喜欢吃草莓",
+                    "confidence": 0.95,
+                }
+            ],
+            ["我喜欢吃草莓"],
+            min_confidence=0.75,
+        )
+        self.assertEqual(updates[0]["action"], "add")
+        self.assertEqual(sum(rejected.values()), 0)
 
     async def test_template_and_short_memory_use_project_auth(self) -> None:
         observed: list[httpx.Request] = []
@@ -48,6 +86,89 @@ class ContextGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(observed)
         self.assertTrue(all(item.headers["Authorization"] == "Bearer test-project-key-do-not-log" for item in observed))
         self.assertTrue(all("project_id" not in item.url.params for item in observed))
+
+    async def test_ensure_template_creates_only_when_missing(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.method == "GET":
+                return httpx.Response(404, json={"detail": "not found"})
+            return httpx.Response(201, json={"id": "template-1"})
+
+        created = await self.make_client(handler).ensure_template(
+            "system", "agent", "seed prompt"
+        )
+        self.assertEqual(created, "created")
+        self.assertEqual(
+            requests,
+            [
+                ("GET", "/v1/context/templates/system/agent"),
+                ("POST", "/v1/context/templates"),
+            ],
+        )
+
+    async def test_ensure_template_preserves_existing_gateway_prompt(self) -> None:
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.method)
+            return httpx.Response(
+                200,
+                json={"id": "template-1", "version": 1, "content": "local seed prompt"},
+            )
+
+        created = await self.make_client(handler).ensure_template(
+            "system", "agent", "local seed prompt"
+        )
+        self.assertEqual(created, "unchanged")
+        self.assertEqual(requests, ["GET"])
+
+    async def test_ensure_template_updates_changed_prompt_with_expected_version(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={"id": "template-1", "version": 4, "content": "old prompt"},
+                )
+            return httpx.Response(
+                200,
+                json={"id": "template-1", "version": 5, "content": "new prompt"},
+            )
+
+        updated = await self.make_client(handler).ensure_template(
+            "system", "agent", "new prompt"
+        )
+        self.assertEqual(updated, "updated")
+        self.assertEqual(requests[1].method, "PATCH")
+        self.assertEqual(requests[1].url.path, "/v1/context/templates/template-1")
+        body = json.loads(requests[1].content)
+        self.assertEqual(body["expected_version"], 4)
+        self.assertEqual(body["name"], "agent")
+        self.assertEqual(body["content"], "new prompt")
+
+    async def test_ensure_template_handles_concurrent_creation(self) -> None:
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.method)
+            if request.method == "GET":
+                if requests.count("GET") == 1:
+                    return httpx.Response(404, json={"detail": "not found"})
+                return httpx.Response(
+                    200,
+                    json={"id": "template-1", "version": 1, "content": "seed prompt"},
+                )
+            return httpx.Response(409, json={"detail": "already exists"})
+
+        created = await self.make_client(handler).ensure_template(
+            "system", "agent", "seed prompt"
+        )
+        self.assertEqual(created, "unchanged")
+        self.assertEqual(requests, ["GET", "POST", "GET"])
 
     async def test_append_sends_ordered_pair_with_ttl_and_messages_are_scoped(self) -> None:
         seen: list[httpx.Request] = []

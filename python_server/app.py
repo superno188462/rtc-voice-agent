@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import asyncio
+import base64
 import json
 import os
-import secrets
+import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
@@ -19,12 +21,13 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.llm import get_llm_service
 from services.rag import get_rag_service
+from services.rag.gateway_vector_store import GatewayVectorStoreError
+from services.rag.knowledge_base import get_knowledge_base_service
 from services.agent import agent_service
 from services.agent.conversation_repository import (
     TurnStateError,
@@ -32,7 +35,14 @@ from services.agent.conversation_repository import (
 )
 from services.trace_service import mark_turn_event
 from services.asr import create_asr_client
+from services.tts import TTSProviderError, create_tts_provider
 from services.context_gateway import ContextGatewayError, get_context_gateway
+from services.context_gateway.bootstrap import ensure_default_templates
+from services.context_gateway.memory_vector_index import (
+    ensure_memory_vector_collection,
+    memory_vector_enabled,
+    query_user_memory_records,
+)
 from tools.rtc_token import AccessToken, Privileges
 from tools.util import assert_value, read_files, wrapper
 
@@ -42,16 +52,11 @@ LOCAL_SCENES_DIR = BASE_DIR / "scenes"
 load_dotenv(BASE_DIR / ".env")
 SCENES = read_files(LOCAL_SCENES_DIR, ".json")
 
-from services.auth.database import get_db_session, get_session_factory
-from services.auth.models import User
-from services.auth.service import (
-    LoginRateLimited,
-    create_auth_session,
-    get_user_by_token,
-    login_user,
-    register_user,
-    revoke_token,
-    session_ttl,
+from services.identity.client import (
+    IdentityAuthResult,
+    IdentityCenterError,
+    IdentityUser,
+    get_identity_center_client,
 )
 
 
@@ -72,11 +77,40 @@ def configure_custom_llm_urls() -> None:
 
 configure_custom_llm_urls()
 
-app = FastAPI(title="RTC AIGC Python Server", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动时同步默认提示词并校验独立的长期记忆向量集合。"""
+
+    try:
+        results = await ensure_default_templates()
+        for template_name, state in results.items():
+            print(f"[context] template={template_name} startup={state}")
+    except ContextGatewayError as exc:
+        # 不输出请求头、响应正文或提示词；Gateway 暂时不可用时仍允许服务启动。
+        print(
+            f"[context] template_bootstrap_failed code={exc.code} "
+            f"status={exc.status_code or 'unavailable'}"
+        )
+    except Exception as exc:
+        print(f"[context] template_bootstrap_failed error={type(exc).__name__}")
+    if memory_vector_enabled():
+        try:
+            await ensure_memory_vector_collection()
+        except GatewayVectorStoreError as exc:
+            print(f"[memory_vector] collection_bootstrap_failed code={exc.code} status={exc.status_code or 'unavailable'}")
+        except Exception as exc:
+            # Context memory remains available if optional semantic indexing is down.
+            print(f"[memory_vector] collection_bootstrap_failed error={type(exc).__name__}")
+    else:
+        print("[memory_vector] disabled missing=GATEWAY_MEMORY_EMBEDDING_MODEL_or_gateway_config")
+    yield
+
+
+app = FastAPI(title="RTC AIGC Python Server", version="1.0.0", lifespan=lifespan)
 configured_origins = [
     origin.strip()
     for origin in os.getenv(
-        "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+        "CORS_ALLOW_ORIGINS", "http://localhost:3002,http://127.0.0.1:3002"
     ).split(",")
     if origin.strip()
 ]
@@ -112,15 +146,58 @@ class AgentTurnRequest(BaseModel):
         max_length=128,
         description="前端为单轮语音分配的唯一 ID，用于耗时关联和防止重复写入。",
     )
+    synthesize_speech: bool = Field(
+        default=True,
+        description="是否将回答通过 TTS 合成；语音输入默认开启，手动文本可关闭。",
+    )
 
 
 class AuthCredentials(BaseModel):
-    username: str = Field(min_length=3, max_length=64)
+    username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
 
 
-def _user_payload(user: User) -> dict[str, Any]:
-    return {"id": user.id, "username": user.username, "role": user.role, "permissions": []}
+class KnowledgeBaseInitializeRequest(BaseModel):
+    description: str = Field(default="RTC Agent 项目知识库", max_length=1000, description="集合说明。")
+    embedding_model: str = Field(min_length=1, max_length=200, description="该集合使用的 Gateway Embedding 模型名。")
+    chunk_size: int = Field(default=1000, ge=100, le=6000, description="项目切片的单条字符上限，必须与集合上限一致。")
+
+
+class KnowledgeDocumentRequest(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=200, description="内部兼容字段；新文档 ID 由后端生成，同路径更新沿用既有 ID。")
+    directory: str = Field(default="", max_length=1000, description="知识库虚拟目录，不含文件名；使用 / 分隔目录层级。")
+    name: str | None = Field(default=None, min_length=1, max_length=500, description="虚拟文件名；文件和直接输入内容统一作为虚拟文件管理。")
+    source_type: str | None = Field(default=None, description="输入来源：file 或 text；兼容旧调用时可省略。")
+    file_name: str | None = Field(default=None, min_length=1, max_length=500, description="旧客户端兼容字段；新客户端使用 name。")
+    title: str = Field(min_length=1, max_length=500, description="用于检索结果展示的标题。")
+    content: str = Field(min_length=1, max_length=200_000, description="解析后的文本内容；项目按集合限制切片并逐条调用 Gateway。")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="用于检索精确过滤的 JSON metadata。")
+
+
+class KnowledgeDocumentBatchRequest(BaseModel):
+    documents: list[KnowledgeDocumentRequest] = Field(min_length=1, max_length=64, description="最多 64 个虚拟文件；项目负责切片，网关逐片嵌入。")
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=10_000, description="相似度检索问题。")
+    top_k: int = Field(default=5, ge=1, le=20, description="最多返回的相关切片数。")
+    metadata: dict[str, Any] | None = Field(default=None, description="可选 metadata 精确过滤条件。")
+
+
+class MemoryVectorSearchRequest(BaseModel):
+    """当前已登录用户的长期记忆向量检索输入。"""
+
+    query: str = Field(min_length=1, max_length=10_000, description="用于语义检索的查询文本，不会写入长期记忆。")
+    top_k: int = Field(default=5, ge=1, le=20, description="最多返回的长期记忆条数。")
+
+
+def _user_payload(user: IdentityUser) -> dict[str, Any]:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "permissions": list(user.permissions),
+    }
 
 
 def _validate_request_origin(request: Request) -> None:
@@ -129,7 +206,7 @@ def _validate_request_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail={"code": "ORIGIN_NOT_ALLOWED"})
 
 
-def _cookie_security() -> tuple[bool, str]:
+def _auth_cookie_settings() -> tuple[bool, str, str | None]:
     secure_setting = os.getenv("AUTH_COOKIE_SECURE")
     secure = (
         secure_setting.strip().lower() == "true"
@@ -137,63 +214,290 @@ def _cookie_security() -> tuple[bool, str]:
         else os.getenv("APP_ENV", "development").strip().lower() == "production"
     )
     same_site = os.getenv("AUTH_COOKIE_SAMESITE", "lax").strip().lower()
+    domain = os.getenv("AUTH_COOKIE_DOMAIN", "").strip() or None
     if same_site not in {"lax", "strict", "none"} or (same_site == "none" and not secure):
         raise RuntimeError("AUTH_COOKIE_SAMESITE_NONE_REQUIRES_SECURE_COOKIE")
-    return secure, same_site
+    return secure, same_site, domain
 
 
-async def require_current_user(
-    request: Request, db: AsyncSession = Depends(get_db_session)
-) -> User:
+async def require_current_user(request: Request) -> IdentityUser:
     _validate_request_origin(request)
-    user = await get_user_by_token(db, request.cookies.get("rtc_agent_session"))
-    if not user:
-        from fastapi import HTTPException
+    try:
+        return await get_identity_center_client().current_user(
+            request.cookies.get("identity_session")
+        )
+    except IdentityCenterError as exc:
+        raise _identity_http_error(exc) from exc
 
-        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
-    return user
+
+def _identity_http_error(error: IdentityCenterError) -> HTTPException:
+    """Map center responses to stable, non-sensitive application errors."""
+
+    if error.status_code == 401:
+        return HTTPException(status_code=401, detail={"code": error.code})
+    if error.code == "IDENTITY_CENTER_BAD_RESPONSE":
+        return HTTPException(status_code=502, detail={"code": error.code})
+    if error.status_code in (403, 409, 422, 429):
+        return HTTPException(
+            status_code=error.status_code, detail={"code": error.code}
+        )
+    return HTTPException(
+        status_code=503, detail={"code": "IDENTITY_CENTER_UNAVAILABLE"}
+    )
 
 
-def _set_auth_cookie(response: JSONResponse, token: str) -> None:
-    secure, same_site = _cookie_security()
+def _vector_gateway_error(error: GatewayVectorStoreError) -> HTTPException:
+    """将向量网关异常转成脱敏且稳定的前端错误契约。"""
+
+    if error.code in {"VECTOR_STORE_NOT_CONFIGURED", "VECTOR_DIMENSIONS_CONFIG_INVALID"}:
+        status_code = 503
+    elif error.code in {"VECTOR_COLLECTION_MODEL_MISMATCH", "VECTOR_COLLECTION_DIMENSIONS_MISMATCH", "VECTOR_COLLECTION_CHUNKING_MISMATCH", "VECTOR_COLLECTION_CHUNK_SIZE_MISMATCH"}:
+        status_code = 409
+    elif error.code in {
+        "VECTOR_EMBEDDING_QUOTA_EXCEEDED",
+        "VECTOR_USER_QUOTA_EXCEEDED",
+        "VECTOR_PROJECT_QUOTA_EXCEEDED",
+    } or error.status_code == 429:
+        status_code = 429
+    elif error.code == "VECTOR_GATEWAY_AUTH_FAILED":
+        status_code = 502
+    elif error.code == "VECTOR_GATEWAY_SERVICE_NOT_ENABLED":
+        status_code = 403
+    elif error.code == "VECTOR_GATEWAY_TIMEOUT":
+        status_code = 504
+    elif error.status_code == 404:
+        status_code = 404
+    elif error.status_code in {502, 503, 504}:
+        status_code = 503 if error.status_code != 504 else 504
+    elif error.status_code == 409:
+        status_code = 409
+    else:
+        status_code = 502
+    messages = {
+        "VECTOR_STORE_NOT_CONFIGURED": "知识库网关配置不完整，请检查后端环境变量。",
+        "VECTOR_DIMENSIONS_CONFIG_INVALID": "向量维度配置无效。",
+        "VECTOR_COLLECTION_MODEL_MISMATCH": "已有集合绑定了不同的 Embedding 模型，请更换集合名或模型配置。",
+        "VECTOR_COLLECTION_DIMENSIONS_MISMATCH": "Embedding 维度与已有集合不匹配。",
+        "VECTOR_COLLECTION_CHUNKING_MISMATCH": "已有集合使用了不同的切片配置。",
+        "VECTOR_COLLECTION_CHUNK_SIZE_MISMATCH": "已有集合的单条文本长度上限与所选值不一致。",
+        "VECTOR_GATEWAY_AUTH_FAILED": "知识库网关鉴权失败，请检查项目 API Key 和服务授权。",
+        "VECTOR_GATEWAY_TIMEOUT": "知识库网关请求超时，请稍后重试。",
+        "VECTOR_GATEWAY_NETWORK_ERROR": "暂时无法连接知识库网关。",
+        "VECTOR_GATEWAY_INVALID_RESPONSE": "知识库网关返回了无法识别的响应。",
+        "VECTOR_COLLECTION_NOT_FOUND": "配置的知识库集合不存在，请先初始化集合。",
+        "VECTOR_GATEWAY_SERVICE_NOT_ENABLED": "网关项目尚未开通向量知识库服务。",
+        "VECTOR_EMBEDDING_QUOTA_EXCEEDED": "Embedding 调用额度不足，请检查 Gateway 配额。",
+        "VECTOR_USER_QUOTA_EXCEEDED": "当前用户的向量服务额度不足。",
+        "VECTOR_PROJECT_QUOTA_EXCEEDED": "当前项目的向量服务额度不足。",
+        "VECTOR_QUOTA_CONFIGURATION_ERROR": "Gateway 向量额度配置异常，请联系管理员。",
+        "VECTOR_GATEWAY_ERROR": "Gateway 向量服务暂时不可用，请稍后重试。",
+    }
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": messages.get(error.code, "知识库操作失败，请检查网关状态。")},
+    )
+
+
+def _memory_vector_gateway_error(error: GatewayVectorStoreError) -> HTTPException:
+    """Map vector adapter errors to messages appropriate for long-term memory search."""
+
+    mapped = _vector_gateway_error(error)
+    messages = {
+        "VECTOR_STORE_NOT_CONFIGURED": "长期记忆向量检索未配置，请检查后端 Gateway Memory 配置。",
+        "VECTOR_GATEWAY_AUTH_FAILED": "长期记忆向量服务鉴权失败，请检查后端项目 API Key。",
+        "VECTOR_GATEWAY_TIMEOUT": "长期记忆向量检索超时，请稍后重试。",
+        "VECTOR_GATEWAY_NETWORK_ERROR": "暂时无法连接长期记忆向量服务。",
+        "VECTOR_GATEWAY_SERVICE_NOT_ENABLED": "Gateway 项目尚未开通向量检索服务。",
+        "VECTOR_COLLECTION_NOT_FOUND": "长期记忆向量集合不存在，请检查后端配置并重启服务。",
+        "VECTOR_COLLECTION_MODEL_MISMATCH": "长期记忆向量集合绑定的 Embedding 模型与配置不一致。",
+        "VECTOR_COLLECTION_CHUNK_SIZE_MISMATCH": "长期记忆向量集合的文本长度配置与项目配置不一致。",
+        "VECTOR_EMBEDDING_QUOTA_EXCEEDED": "Embedding 调用额度不足，请检查 Gateway 配额。",
+        "VECTOR_USER_QUOTA_EXCEEDED": "当前用户的向量服务额度不足。",
+        "VECTOR_PROJECT_QUOTA_EXCEEDED": "当前项目的向量服务额度不足。",
+    }
+    return HTTPException(
+        status_code=mapped.status_code,
+        detail={"code": error.code, "message": messages.get(error.code, "长期记忆向量检索失败，请检查 Gateway 配置。")},
+    )
+
+
+def _set_identity_cookie(response: JSONResponse, result: IdentityAuthResult) -> None:
+    secure, same_site, domain = _auth_cookie_settings()
     response.set_cookie(
-        key="rtc_agent_session",
-        value=token,
-        max_age=session_ttl(),
+        key="identity_session",
+        value=result.session_cookie,
+        max_age=result.max_age,
         httponly=True,
         secure=secure,
         samesite=same_site,
-        # 登录还保护兼容路由 /getScenes、/proxy 和 /debug/chat。
+        domain=domain,
         path="/",
     )
+
+
+def _delete_identity_cookie(response: JSONResponse) -> None:
+    secure, same_site, domain = _auth_cookie_settings()
+    response.delete_cookie(
+        "identity_session",
+        path="/",
+        domain=domain,
+        httponly=True,
+        secure=secure,
+        samesite=same_site,
+    )
+
+
+@app.get("/api/knowledge-base")
+async def knowledge_base_status(user: IdentityUser = Depends(require_current_user)) -> dict[str, Any]:
+    """读取当前服务端配置集合的状态；不向浏览器返回项目 API Key。"""
+
+    del user
+    try:
+        return await get_knowledge_base_service().status()
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+
+
+@app.post("/api/knowledge-base/initialize")
+async def initialize_knowledge_base(
+    payload: KnowledgeBaseInitializeRequest,
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """创建配置指定的 Gateway collection，或验证其模型/切片参数。"""
+
+    del user
+    try:
+        return await get_knowledge_base_service().initialize(
+            description=payload.description,
+            model=payload.embedding_model,
+            chunk_size=payload.chunk_size,
+        )
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+
+
+@app.get("/api/knowledge-base/documents")
+async def list_knowledge_documents(user: IdentityUser = Depends(require_current_user)) -> dict[str, Any]:
+    """列出本项目持久化的知识文档，不返回正文。"""
+
+    del user
+    return {"documents": await get_knowledge_base_service().list_documents()}
+
+
+@app.post("/api/knowledge-base/documents")
+async def upsert_knowledge_document(
+    payload: KnowledgeDocumentRequest,
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """按知识库虚拟路径创建或更新条目，项目切片后由 Gateway 逐片生成向量。"""
+
+    del user
+    try:
+        result = await get_knowledge_base_service().upsert_document(
+            document_id=payload.document_id,
+            title=payload.title,
+            content=payload.content,
+            metadata=payload.metadata,
+            file_name=payload.file_name,
+            directory=payload.directory,
+            name=payload.name,
+            source_type=payload.source_type,
+        )
+        return {"document_id": result["id"], "result": result["result"]}
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_KNOWLEDGE_DOCUMENT", "message": str(error)}) from error
+
+
+@app.post("/api/knowledge-base/documents/batch")
+async def upsert_knowledge_documents(
+    payload: KnowledgeDocumentBatchRequest,
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """批量写入 1 至 64 个虚拟文件；相同目录/名称会更新原条目。"""
+
+    del user
+    try:
+        documents = [item.model_dump() for item in payload.documents]
+        results = await get_knowledge_base_service().upsert_documents(documents)
+        return {"documents": [{"document_id": item["id"], "result": item["result"]} for item in results]}
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_KNOWLEDGE_DOCUMENT", "message": str(error)}) from error
+
+
+@app.delete("/api/knowledge-base/documents")
+async def delete_knowledge_document(
+    document_id: str = Query(min_length=1, max_length=200),
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """按稳定文档 ID 删除该文档及网关保存的向量切片。"""
+
+    del user
+    try:
+        return await get_knowledge_base_service().delete_document(document_id)
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+
+
+@app.post("/api/knowledge-base/search")
+async def search_knowledge_base(
+    payload: KnowledgeSearchRequest,
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """提供管理页的检索预览，响应字段与 Agent RAG 适配层一致。"""
+
+    del user
+    try:
+        results = await get_knowledge_base_service().search(
+            payload.query,
+            top_k=payload.top_k,
+            metadata=payload.metadata,
+        )
+        return {"results": results}
+    except GatewayVectorStoreError as error:
+        raise _vector_gateway_error(error) from error
+
+
+@app.post("/api/agent/memories/search", summary="检索当前用户的长期记忆向量")
+async def search_long_term_memory_vectors(
+    payload: MemoryVectorSearchRequest,
+    user: IdentityUser = Depends(require_current_user),
+) -> dict[str, Any]:
+    """Query all scopes in the dedicated memory collection for the authenticated user only."""
+
+    try:
+        results = await query_user_memory_records(
+            get_context_gateway(), user.id, payload.query, top_k=payload.top_k
+        )
+        return {"results": results}
+    except GatewayVectorStoreError as error:
+        raise _memory_vector_gateway_error(error) from error
+    except ContextGatewayError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": "无法读取长期记忆，请检查 Gateway 上下文服务后重试。"},
+        ) from error
 
 
 @app.post("/api/auth/register", status_code=201)
 async def auth_register(
     credentials: AuthCredentials,
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
 ) -> JSONResponse:
-    """本地账号注册。首版不依赖网关的认证或数据库。"""
-    from fastapi import HTTPException
-    from sqlalchemy.exc import IntegrityError
+    """代理身份中心注册，并在本服务域名下设置 HttpOnly 会话 Cookie。"""
 
     _validate_request_origin(request)
-    if os.getenv("AUTH_ALLOW_REGISTRATION", "true").strip().lower() != "true":
-        raise HTTPException(status_code=403, detail={"code": "REGISTRATION_DISABLED"})
     try:
-        user = await register_user(db, credentials.username, credentials.password)
-    except ValueError as exc:
-        code = str(exc)
-        status = 409 if code == "USERNAME_TAKEN" else 422
-        raise HTTPException(status_code=status, detail={"code": code}) from exc
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=409, detail={"code": "USERNAME_TAKEN"}) from exc
-
-    token, _ = await create_auth_session(db, user)
-    response = JSONResponse({"user": _user_payload(user)}, status_code=201)
-    _set_auth_cookie(response, token)
+        result = await get_identity_center_client().register(
+            credentials.username, credentials.password
+        )
+    except IdentityCenterError as exc:
+        raise _identity_http_error(exc) from exc
+    response = JSONResponse({"user": _user_payload(result.user)}, status_code=201)
+    _set_identity_cookie(response, result)
     return response
 
 
@@ -201,49 +505,41 @@ async def auth_register(
 async def auth_login(
     credentials: AuthCredentials,
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
 ) -> JSONResponse:
     _validate_request_origin(request)
-    client_ip = request.client.host if request.client else "unknown"
     try:
-        result = await login_user(db, credentials.username, credentials.password, client_ip)
-    except LoginRateLimited as exc:
-        raise HTTPException(
-            status_code=429,
-            detail={"code": "LOGIN_RATE_LIMITED", "message": "登录尝试过于频繁，请稍后重试"},
-            headers={"Retry-After": str(exc.retry_after)},
-        ) from exc
-    except ValueError as exc:
-        # 避免通过不同响应枚举账号格式与存在性。
-        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS"}) from exc
-    if not result:
-        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS"})
-    user, token, _ = result
-    response = JSONResponse({"user": _user_payload(user)})
-    _set_auth_cookie(response, token)
+        result = await get_identity_center_client().login(
+            credentials.username, credentials.password
+        )
+    except IdentityCenterError as exc:
+        raise _identity_http_error(exc) from exc
+    response = JSONResponse({"user": _user_payload(result.user)})
+    _set_identity_cookie(response, result)
     return response
 
 
 @app.get("/api/auth/me")
-async def auth_me(user: User = Depends(require_current_user)) -> dict[str, object]:
+async def auth_me(user: IdentityUser = Depends(require_current_user)) -> dict[str, object]:
     return {"user": _user_payload(user)}
 
 
 @app.post("/api/auth/logout")
 async def auth_logout(
-    request: Request, db: AsyncSession = Depends(get_db_session)
+    request: Request,
 ) -> JSONResponse:
+    """Revoke the upstream session and clear this application's HttpOnly cookie."""
+
     _validate_request_origin(request)
-    await revoke_token(db, request.cookies.get("rtc_agent_session"))
-    secure, same_site = _cookie_security()
-    response = JSONResponse({"logged_out": True})
-    response.delete_cookie(
-        "rtc_agent_session",
-        path="/",
-        httponly=True,
-        secure=secure,
-        samesite=same_site,
-    )
+    try:
+        await get_identity_center_client().logout(
+            request.cookies.get("identity_session")
+        )
+        response = JSONResponse({"logged_out": True})
+    except IdentityCenterError:
+        response = JSONResponse(
+            {"detail": {"code": "IDENTITY_CENTER_UNAVAILABLE"}}, status_code=503
+        )
+    _delete_identity_cookie(response)
     return response
 
 
@@ -253,6 +549,8 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
 
     浏览器接口保持稳定；ASR_PROVIDER 选择网关或火山适配器，统一输出 asr_partial、
     asr_final、error 事件。输入音频为 16 kHz、16-bit、单声道 PCM 二进制帧。
+    上游空闲达到 ASR_IDLE_CLOSE_SECONDS 后结束并关闭当前识别会话；浏览器连接和 Agent
+    逻辑会话不关闭，后续 PCM 会创建新上游连接。asr_ready 事件的 generation 标识连接代次。
     """
 
     session = await agent_service.get_session(session_id)
@@ -264,16 +562,14 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=4403, reason="ORIGIN_NOT_ALLOWED")
         return
     try:
-        factory = get_session_factory()
-        async with factory() as db:
-            user = await get_user_by_token(
-                db, websocket.cookies.get("rtc_agent_session")
-            )
-    except Exception:
-        await websocket.close(code=1011, reason="AUTH_DATABASE_UNAVAILABLE")
-        return
-    if not user:
-        await websocket.close(code=4401, reason="AUTH_REQUIRED")
+        user = await get_identity_center_client().current_user(
+            websocket.cookies.get("identity_session")
+        )
+    except IdentityCenterError as exc:
+        if exc.status_code == 401 or exc.code == "AUTH_REQUIRED":
+            await websocket.close(code=4401, reason="AUTH_REQUIRED")
+        else:
+            await websocket.close(code=1011, reason="IDENTITY_CENTER_UNAVAILABLE")
         return
     if session.account_id != user.id:
         await websocket.close(code=4403, reason="SESSION_FORBIDDEN")
@@ -293,46 +589,238 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
     phase = "upstream_connect"
     pending_turn_ids: list[str] = []
     partial_turn_ids: set[str] = set()
-    try:
-        await asr_client.connect()
-        phase = "send_start_request"
-        await websocket.send_json({"type": "asr_ready"})
-        phase = "streaming"
+    turn_generations: dict[str, int] = {}
+    failed_generations: set[int] = set()
+    audio_queue: asyncio.Queue[tuple[str, Any] | None] = asyncio.Queue(maxsize=128)
+    idle_close_seconds = max(1.0, float(os.getenv("ASR_IDLE_CLOSE_SECONDS", "5")))
+    finalize_timeout_seconds = max(
+        0.5, float(os.getenv("ASR_FINALIZE_TIMEOUT_SECONDS", "3"))
+    )
 
-        async def receive_provider_results() -> None:
-            async for event in asr_client.receive_events():
-                event_type = event.get("type")
-                turn_id = None
-                if event_type == "asr_partial":
-                    turn_id = next(
-                        (candidate for candidate in pending_turn_ids if candidate not in partial_turn_ids),
-                        None,
-                    )
-                    if turn_id:
-                        partial_turn_ids.add(turn_id)
-                        mark_turn_event(turn_id, "asr_first_partial")
-                elif event_type == "asr_final" and pending_turn_ids:
-                    turn_id = pending_turn_ids.pop(0)
-                    partial_turn_ids.discard(turn_id)
-                    event["turn_id"] = turn_id
-                    mark_turn_event(turn_id, "asr_final")
-                await websocket.send_json(event)
-                if event_type == "error":
-                    return
-
-        async def forward_audio() -> None:
+    async def receive_browser_messages() -> None:
+        try:
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
                     return
                 pcm = message.get("bytes")
                 if pcm:
-                    # RTC 回调提供短 PCM 帧；适配器按对应上游协议即时转发。
-                    await asr_client.send_audio(pcm)
+                    await audio_queue.put(("audio", pcm))
                 elif message.get("text"):
-                    # 前端 VAD 控制帧仅用于耗时关联，不转发到 ASR 上游。
+                    await audio_queue.put(("control", message["text"]))
+        finally:
+            await audio_queue.put(None)
+
+    async def receive_provider_results(client, generation: int) -> None:
+        async for event in client.receive_events():
+            event_type = event.get("type")
+            turn_id = None
+            if event_type == "asr_partial":
+                turn_id = next(
+                    (
+                        candidate
+                        for candidate in pending_turn_ids
+                        if turn_generations.get(candidate) == generation
+                        and candidate not in partial_turn_ids
+                    ),
+                    None,
+                )
+                if turn_id:
+                    partial_turn_ids.add(turn_id)
+                    mark_turn_event(turn_id, "asr_first_partial")
+            elif event_type == "asr_final":
+                turn_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(pending_turn_ids)
+                        if turn_generations.get(candidate) == generation
+                    ),
+                    None,
+                )
+                if turn_index is not None:
+                    turn_id = pending_turn_ids.pop(turn_index)
+                    turn_generations.pop(turn_id, None)
+                    partial_turn_ids.discard(turn_id)
+            if event_type == "asr_final" and turn_id:
+                partial_turn_ids.discard(turn_id)
+                event["turn_id"] = turn_id
+                mark_turn_event(turn_id, "asr_final")
+            elif event_type == "error":
+                failed_generations.add(generation)
+                turn_id = next(
+                    (
+                        candidate
+                        for candidate in pending_turn_ids
+                        if turn_generations.get(candidate) == generation
+                    ),
+                    None,
+                )
+                if turn_id:
+                    event["turn_id"] = turn_id
+                print(
+                    f"[asr] upstream_error provider={provider} generation={generation} "
+                    f"code={event.get('code', 'ASR_UPSTREAM_FAILED')} "
+                    f"request_id={event.get('request_id', 'unavailable')} "
+                    f"message={str(event.get('message', ''))[:240]!r}"
+                )
+            event["asr_generation"] = generation
+            try:
+                await websocket.send_json(event)
+            except (WebSocketDisconnect, RuntimeError):
+                return
+            if event_type == "error":
+                return
+
+    async def close_upstream(client, reader_task: asyncio.Task | None) -> None:
+        if not client:
+            return
+        try:
+            await client.finish()
+        except Exception as exc:
+            print(f"[asr] upstream_finish_failed error={type(exc).__name__}")
+        if reader_task:
+            done, _ = await asyncio.wait(
+                {reader_task}, timeout=finalize_timeout_seconds
+            )
+            if not done:
+                reader_task.cancel()
+                await asyncio.gather(reader_task, return_exceptions=True)
+            else:
+                try:
+                    reader_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    print(f"[asr] upstream_reader_ended error={type(exc).__name__}")
+        try:
+            await client.close()
+        except Exception as exc:
+            print(f"[asr] upstream_close_failed error={type(exc).__name__}")
+
+    async def retire_unfinalized_turns(
+        generation: int, *, suppress_warning: bool = False
+    ) -> None:
+        unfinished = [
+            turn_id
+            for turn_id in pending_turn_ids
+            if turn_generations.get(turn_id) == generation
+        ]
+        for turn_id in unfinished:
+            pending_turn_ids.remove(turn_id)
+            partial_turn_ids.discard(turn_id)
+            turn_generations.pop(turn_id, None)
+            print(
+                f"[asr] turn_unfinalized generation={generation} turn_id={turn_id}"
+            )
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "asr_turn_incomplete",
+                        "code": "ASR_TURN_FINAL_TIMEOUT",
+                        "turn_id": turn_id,
+                        "generation": generation,
+                        "suppress_warning": suppress_warning,
+                    }
+                )
+            except (WebSocketDisconnect, RuntimeError):
+                return
+
+    async def manage_upstream() -> None:
+        nonlocal phase
+        client = asr_client
+        generation = 0
+        reader_task: asyncio.Task | None = None
+        audio_bytes = 0
+        last_audio_at = asyncio.get_running_loop().time()
+
+        async def connect_client(new_client, *, reconnect: bool) -> tuple[Any, asyncio.Task]:
+            nonlocal generation, phase
+            phase = "upstream_connect"
+            await new_client.connect()
+            generation += 1
+            print(
+                f"[asr] upstream_connected provider={provider} generation={generation}"
+            )
+            task = asyncio.create_task(
+                receive_provider_results(new_client, generation)
+            )
+            await websocket.send_json(
+                {"type": "asr_ready", "reconnected": reconnect, "generation": generation}
+            )
+            phase = "streaming"
+            return new_client, task
+
+        try:
+            client, reader_task = await connect_client(client, reconnect=False)
+            last_audio_at = asyncio.get_running_loop().time()
+            while True:
+                elapsed = asyncio.get_running_loop().time() - last_audio_at
+                wait_seconds = max(0.0, idle_close_seconds - elapsed) if client else None
+                queue_task = asyncio.create_task(audio_queue.get())
+                wait_tasks = {queue_task}
+                if reader_task:
+                    wait_tasks.add(reader_task)
+                done, _ = await asyncio.wait(
+                    wait_tasks,
+                    timeout=wait_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    queue_task.cancel()
+                    await asyncio.gather(queue_task, return_exceptions=True)
+                    if client:
+                        print(
+                            f"[asr] upstream_idle_close provider={provider} "
+                            f"generation={generation} idle_seconds={idle_close_seconds:g} "
+                            f"audio_bytes={audio_bytes} audio_ms={audio_bytes / 32:.1f}"
+                        )
+                        await close_upstream(client, reader_task)
+                        await retire_unfinalized_turns(
+                            generation,
+                            suppress_warning=generation in failed_generations,
+                        )
+                        failed_generations.discard(generation)
+                        client = None
+                        reader_task = None
+                        audio_bytes = 0
+                    last_audio_at = asyncio.get_running_loop().time()
+                    continue
+
+                if reader_task and reader_task in done:
                     try:
-                        control = json.loads(message["text"])
+                        reader_task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        print(
+                            f"[asr] upstream_reader_ended provider={provider} "
+                            f"generation={generation} error={type(exc).__name__}"
+                        )
+                    await close_upstream(client, reader_task)
+                    await retire_unfinalized_turns(
+                        generation,
+                        suppress_warning=generation in failed_generations,
+                    )
+                    failed_generations.discard(generation)
+                    client = None
+                    reader_task = None
+                    audio_bytes = 0
+                if queue_task not in done:
+                    queue_task.cancel()
+                    await asyncio.gather(queue_task, return_exceptions=True)
+                    continue
+                queued = queue_task.result()
+
+                if queued is None:
+                    await close_upstream(client, reader_task)
+                    client = None
+                    reader_task = None
+                    return
+
+                kind, payload = queued
+                if kind == "control":
+                    try:
+                        control = json.loads(payload)
                     except (TypeError, ValueError):
                         continue
                     if control.get("type") != "trace":
@@ -346,19 +834,46 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
                         mark_turn_event(turn_id, "speech_start")
                     elif trace_event == "speech_end":
                         mark_turn_event(turn_id, "speech_end")
+                    elif trace_event == "asr_final":
+                        mark_turn_event(turn_id, "asr_final")
+                    continue
 
-        provider_task = asyncio.create_task(receive_provider_results())
-        audio_task = asyncio.create_task(forward_audio())
+                if reader_task and reader_task.done():
+                    await close_upstream(client, reader_task)
+                    client = None
+                    reader_task = None
+                if client is None:
+                    client = create_asr_client(session.user_id)
+                    client, reader_task = await connect_client(client, reconnect=True)
+                    audio_bytes = 0
+                phase = "streaming"
+                for candidate in pending_turn_ids:
+                    if candidate not in turn_generations:
+                        turn_generations[candidate] = generation
+                await client.send_audio(payload)
+                audio_bytes += len(payload)
+                last_audio_at = asyncio.get_running_loop().time()
+        finally:
+            await close_upstream(client, reader_task)
+
+    browser_task = asyncio.create_task(receive_browser_messages())
+    upstream_task = asyncio.create_task(manage_upstream())
+    try:
         done, pending = await asyncio.wait(
-            {provider_task, audio_task}, return_when=asyncio.FIRST_COMPLETED
+            {browser_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED
         )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
             exception = task.exception()
             if exception:
                 raise exception
+        if browser_task in done:
+            await upstream_task
+        else:
+            browser_task.cancel()
+            await asyncio.gather(browser_task, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -377,17 +892,13 @@ async def agent_asr_stream(websocket: WebSocket, session_id: str) -> None:
         except Exception:
             pass
     finally:
-        try:
-            await asr_client.finish()
-        except Exception:
-            pass
-        try:
-            await asr_client.close()
-        except Exception:
-            pass
+        for task in (browser_task, upstream_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(browser_task, upstream_task, return_exceptions=True)
 
 
-def _session_is_owned(session, user: User) -> bool:
+def _session_is_owned(session, user: IdentityUser) -> bool:
     return bool(session and session.account_id == user.id)
 
 
@@ -395,7 +906,7 @@ def _session_is_owned(session, user: User) -> bool:
 async def mock_llm_turn(
     session_id: str,
     request: AgentTurnRequest,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ):
     """接收真实 ASR 结果，流式返回固定 mock LLM 文本，不调用外部模型。"""
 
@@ -425,7 +936,7 @@ async def mock_llm_turn(
 @app.post("/api/agent/sessions")
 async def create_agent_session(
     request: AgentSessionRequest,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, Any]:
     """创建本次临时 RTC Agent 连接，并关联当前用户的稳定逻辑对话。"""
 
@@ -454,7 +965,7 @@ async def create_agent_session(
 async def agent_turn(
     session_id: str,
     request: AgentTurnRequest,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ):
     """提交 ASR 定稿文本并以 SSE 返回已配置 LLM 服务的生成增量。"""
 
@@ -465,21 +976,129 @@ async def agent_turn(
         return JSONResponse({"error": {"code": "EMPTY_TEXT"}}, status_code=400)
 
     async def stream_response():
+        events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        sentences: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+        tts_provider = None
+        if request.synthesize_speech:
+            try:
+                tts_provider = create_tts_provider()
+                tts_provider.validate()
+            except TTSProviderError as exc:
+                tts_provider = None
+                await events.put({"type": "tts_error", "code": str(exc)})
+
+        async def synthesize_sentences() -> None:
+            if tts_provider is None:
+                # 消费掉生产者的结束标记；整体 done 还需等记忆分析轨迹完成。
+                while await sentences.get() is not None:
+                    pass
+                await events.put({"type": "audio_done"})
+                return
+
+            tts_available = True
+            while True:
+                item = await sentences.get()
+                if item is None:
+                    break
+                sequence, sentence = item
+                if not tts_available:
+                    continue
+                try:
+                    chunk_index = 0
+                    async for audio_chunk in tts_provider.synthesize(
+                        sentence, audio_format="pcm"
+                    ):
+                        if audio_chunk:
+                            await events.put(
+                                {
+                                    "type": "audio_chunk",
+                                    "sequence": sequence,
+                                    "chunk_index": chunk_index,
+                                    "audio_base64": base64.b64encode(audio_chunk).decode("ascii"),
+                                    "sample_rate": 24000,
+                                }
+                            )
+                            chunk_index += 1
+                    if chunk_index == 0:
+                        await events.put({"type": "tts_error", "code": "TTS_EMPTY_AUDIO"})
+                except TTSProviderError as exc:
+                    await events.put({"type": "tts_error", "code": str(exc)})
+                    tts_available = False
+                except Exception as exc:
+                    print(f"[tts] synthesis_failed turn_id={request.turn_id or 'unavailable'} error={type(exc).__name__}")
+                    await events.put({"type": "tts_error", "code": "TTS_UPSTREAM_FAILED"})
+                    tts_available = False
+            await events.put({"type": "audio_done"})
+
+        async def generate_answer() -> None:
+            sentence_buffer = ""
+            sentence_sequence = 0
+            try:
+                async def publish_trace(trace_event: dict[str, Any]) -> None:
+                    await events.put(trace_event)
+
+                async for text_delta in agent_service.stream_turn(
+                    session,
+                    request.text.strip(),
+                    request.turn_id,
+                    on_trace=publish_trace,
+                ):
+                    await events.put({"type": "text_delta", "text": text_delta})
+                    if tts_provider is None:
+                        continue
+                    sentence_buffer += text_delta
+                    while sentence_buffer:
+                        match = re.search(r"[。！？!?；;\n]+", sentence_buffer)
+                        if match:
+                            boundary = match.end()
+                        elif len(sentence_buffer) >= 500:
+                            boundary = 500
+                        else:
+                            break
+                        sentence = sentence_buffer[:boundary].strip()
+                        sentence_buffer = sentence_buffer[boundary:]
+                        if sentence:
+                            await sentences.put((sentence_sequence, sentence))
+                            sentence_sequence += 1
+                if sentence_buffer.strip() and tts_provider is not None:
+                    await sentences.put((sentence_sequence, sentence_buffer.strip()))
+                await events.put({"type": "llm_done"})
+            except ContextGatewayError as exc:
+                print(f"[agent] context turn failed code={exc.code} status={exc.status_code or 'none'}")
+                await events.put({"type": "error", "code": exc.code})
+            except TurnStateError as exc:
+                await events.put({"type": "error", "code": exc.code})
+            except (httpx.HTTPError, RuntimeError, ValueError, KeyError, IndexError) as exc:
+                # 客户端只收稳定错误类型；服务端记录异常类别，不记录凭据或对话内容。
+                print(f"[agent] LLM turn failed: {type(exc).__name__}")
+                await events.put({"type": "error", "code": "LLM_REQUEST_FAILED"})
+            finally:
+                await sentences.put(None)
+
+        tts_task = asyncio.create_task(synthesize_sentences())
+        answer_task = asyncio.create_task(generate_answer())
+        audio_done = False
+        memory_analysis_done = False
         try:
-            async for text_delta in agent_service.stream_turn(
-                session, request.text.strip(), request.turn_id
-            ):
-                yield f"data: {json.dumps({'type': 'text_delta', 'text': text_delta}, ensure_ascii=False)}\n\n"
-            yield 'data: {"type":"done"}\n\n'
-        except ContextGatewayError as exc:
-            print(f"[agent] context turn failed code={exc.code} status={exc.status_code or 'none'}")
-            yield f"data: {json.dumps({'type': 'error', 'code': exc.code})}\n\n"
-        except TurnStateError as exc:
-            yield f"data: {json.dumps({'type': 'error', 'code': exc.code})}\n\n"
-        except (httpx.HTTPError, RuntimeError, ValueError, KeyError, IndexError) as exc:
-            # 客户端只收稳定错误类型；服务端记录异常类别，不记录凭据或对话内容。
-            print(f"[agent] LLM turn failed: {type(exc).__name__}")
-            yield 'data: {"type":"error","code":"LLM_REQUEST_FAILED"}\n\n'
+            while True:
+                event = await events.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "audio_done":
+                    audio_done = True
+                elif event["type"] == "trace" and event.get("stage") == "memory_analysis":
+                    memory_analysis_done = event.get("status") in {"completed", "degraded", "failed"}
+                elif event["type"] == "error":
+                    break
+                if audio_done and memory_analysis_done:
+                    yield 'data: {"type":"done"}\n\n'
+                    break
+        finally:
+            for task in (answer_task, tts_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(answer_task, tts_task, return_exceptions=True)
 
     return StreamingResponse(
         stream_response(),
@@ -492,7 +1111,7 @@ async def agent_turn(
 async def agent_session_messages(
     session_id: str,
     limit: int = Query(default=50, ge=1, le=100),
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, Any]:
     """读取当前逻辑会话的 Gateway 短期消息，用于新 RTC 房间恢复字幕。"""
 
@@ -515,7 +1134,7 @@ async def agent_session_messages(
 @app.post("/api/agent/sessions/{session_id}/mock-turns")
 async def mock_agent_turn(
     session_id: str,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ):
     """模拟一次语音轮次：返回固定 ASR 识别文本及固定 LLM 回复，不调用外部模型。"""
 
@@ -542,7 +1161,7 @@ async def mock_agent_turn(
 @app.delete("/api/agent/sessions/{session_id}")
 async def close_agent_session(
     session_id: str,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, bool]:
     session = await agent_service.get_session(session_id)
     if not _session_is_owned(session, user):
@@ -553,7 +1172,7 @@ async def close_agent_session(
 @app.post("/api/agent/sessions/{session_id}/interrupt")
 async def interrupt_agent_session(
     session_id: str,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, bool]:
     session = await agent_service.get_session(session_id)
     if not _session_is_owned(session, user):
@@ -564,7 +1183,7 @@ async def interrupt_agent_session(
 @app.post("/debug/chat")
 async def debug_chat(
     request: DebugRequest,
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, Any]:
     """构造测试请求并直接调用正式 chat_callback，收集其 SSE 输出。"""
     del user
@@ -754,7 +1373,7 @@ async def proxy(
     payload: dict[str, Any] = Body(default={}),
     Action: str | None = Query(None),
     Version: str = Query("2024-12-01"),
-    user: User = Depends(require_current_user),
+    user: IdentityUser = Depends(require_current_user),
 ) -> dict[str, Any]:
     """代理 AIGC VoiceChat OpenAPI 请求。"""
     del user
@@ -805,7 +1424,7 @@ async def proxy(
 
 
 @app.post("/getScenes")
-async def get_scenes(user: User = Depends(require_current_user)) -> dict[str, Any]:
+async def get_scenes(user: IdentityUser = Depends(require_current_user)) -> dict[str, Any]:
     """读取场景并为该次登录后的页面访问签发独立 RTC 房间和身份。"""
 
     async def logic() -> dict[str, Any]:
@@ -862,6 +1481,15 @@ async def get_scenes(user: User = Depends(require_current_user)) -> dict[str, An
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=3001, reload=True)
+    parser = argparse.ArgumentParser(description="运行 RTC AIGC Python Server")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "8002")),
+        help="监听端口（默认读取 PORT 环境变量，未设置时为 8002）",
+    )
+    args = parser.parse_args()
+    uvicorn.run("app:app", host="0.0.0.0", port=args.port, reload=True)

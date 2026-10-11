@@ -21,11 +21,12 @@ def _frame(
     json_payload: bool,
     sequence: int,
 ) -> bytes:
-    """构造带长度及 gzip 压缩载荷的客户端消息。"""
+    """构造客户端消息；仅非空载荷 gzip 压缩，空结束帧标记为未压缩。"""
 
-    packed = gzip.compress(payload) if payload else b""
+    use_compression = bool(payload)
+    packed = gzip.compress(payload) if use_compression else b""
     return (
-        _header(message_type, flags, 1 if json_payload else 0, 1)
+        _header(message_type, flags, 1 if json_payload else 0, int(use_compression))
         + struct.pack(">i", sequence)
         + struct.pack(">I", len(packed))
         + packed

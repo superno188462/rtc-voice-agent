@@ -73,6 +73,9 @@ export class RTCClient {
   private _videoCaptureDevice?: string;
 
   createEngine = async () => {
+    if (!this.basicInfo?.app_id) {
+      throw new Error('RTC_CONFIG_NOT_LOADED');
+    }
     this.engine = VERTC.createEngine(this.basicInfo.app_id);
     this.engine.enableAudioPropertiesReport({ interval: 200 });
     try {

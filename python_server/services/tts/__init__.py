@@ -1,5 +1,6 @@
-"""TTS 服务边界；具体供应商适配器将在接入语音合成时实现。"""
+"""TTS 服务边界与供应商适配器。"""
 
-from .provider import TTSProvider
+from .provider import TTSProvider, TTSProviderError
+from .volcengine import VolcEngineTTSProvider, create_tts_provider
 
-__all__ = ["TTSProvider"]
+__all__ = ["TTSProvider", "TTSProviderError", "VolcEngineTTSProvider", "create_tts_provider"]

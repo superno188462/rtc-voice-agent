@@ -1,54 +1,41 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rtc-voice-agent.local/schemas/user-profile-v1.json",
-  "title": "RTC Voice Agent user profile v1",
-  "description": "Stable, non-sensitive user preferences used to personalize future conversations.",
+  "$id": "https://rtc-voice-agent.local/schemas/user-profile-v4.json",
+  "title": "RTC Voice Agent user profile v4",
+  "description": "Cross-project stable, non-sensitive user traits used to personalize future conversations. Domains are open; relation values are normalized. Legacy v3 preferences are migrated when read.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version"],
   "properties": {
     "schema_version": {
-      "const": 1,
+      "const": 4,
       "description": "Profile schema version owned and validated by this project."
     },
-    "preferred_language": {
-      "type": "string",
-      "enum": ["zh-CN", "en-US"],
-      "description": "Explicitly expressed preferred response language."
-    },
-    "response_style": {
-      "type": "string",
-      "enum": ["concise", "balanced", "detailed"],
-      "description": "Explicitly expressed preferred response detail level."
-    },
-    "interests": {
-      "$ref": "#/$defs/stringList",
-      "description": "Stable user interests explicitly stated in conversation."
-    },
-    "food_preferences": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "likes": {
-          "$ref": "#/$defs/stringList",
-          "description": "Foods the user explicitly said they like."
-        },
-        "dislikes": {
-          "$ref": "#/$defs/stringList",
-          "description": "Foods the user explicitly said they dislike."
-        }
-      }
+    "traits": {
+      "type": "array",
+      "description": "Stable cross-project preferences, capabilities, and general tendencies. Temporary choices, project facts, goals, and events belong in long-term memory or are not stored.",
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/trait"}
     }
   },
   "$defs": {
-    "stringList": {
-      "type": "array",
-      "maxItems": 20,
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 80
+    "trait": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "relation", "subject", "value"],
+      "properties": {
+        "domain": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,39}$",
+          "description": "Open lowercase domain such as food, topic, skill, decision_style, or communication."
+        },
+        "relation": {
+          "type": "string",
+          "enum": ["likes", "dislikes", "prefers", "avoids", "proficient_in", "tends_to"],
+          "description": "Normalized relation; direct opposites replace one another for the same domain and subject."
+        },
+        "subject": {"type": "string", "minLength": 1, "maxLength": 120},
+        "value": {"type": ["string", "null"], "maxLength": 120}
       }
     }
   }

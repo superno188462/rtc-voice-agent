@@ -10,7 +10,6 @@ import {
   NetworkQuality,
   RemoteAudioStats,
 } from '@volcengine/rtc';
-import RtcClient from '@/lib/RtcClient';
 
 export interface IUser {
   username?: string;
@@ -34,6 +33,25 @@ export interface Msg {
   paragraph?: boolean;
   definite?: boolean;
   isInterrupted?: boolean;
+}
+
+export interface AgentTraceEvent {
+  type: 'trace';
+  turn_id: string;
+  stage: string;
+  status: string;
+  summary: string;
+  details?: Record<string, unknown>;
+  at?: number;
+}
+
+export interface AgentTraceTurn {
+  turnId: string;
+  question: string;
+  startedAt: number;
+  completedAt?: number;
+  answer?: string;
+  events: AgentTraceEvent[];
 }
 
 export interface SceneConfig {
@@ -108,6 +126,10 @@ export interface RoomState {
    * @brief 对话记录
    */
   msgHistory: Msg[];
+  /** 当前身份在 Agent Gateway 中的临时会话句柄，可由语音或文本入口共用。 */
+  agentSessionId: string;
+  /** 最近数轮执行轨迹；仅包含阶段状态与检索资料，不包含模型隐藏推理。 */
+  agentTraceTurns: AgentTraceTurn[];
 
   /**
    * @brief 当前的对话
@@ -163,6 +185,8 @@ const initialState: RoomState = {
   networkQuality: NetworkQuality.UNKNOWN,
 
   msgHistory: [],
+  agentSessionId: '',
+  agentTraceTurns: [],
   currentConversation: {},
   isShowSubtitle: true,
   isFullScreen: false,
@@ -204,6 +228,7 @@ export const roomSlice = createSlice({
       state.asrStatus = 'idle';
       state.asrPartialText = '';
       state.isAIGCEnable = false;
+      state.agentSessionId = '';
     },
     remoteUserJoin: (state, { payload }) => {
       state.remoteUsers.push(payload);
@@ -223,12 +248,6 @@ export const roomSlice = createSlice({
 
     updateRTCConfig: (state, { payload }) => {
       state.rtcConfigMap = payload;
-      RtcClient.basicInfo = {
-        app_id: payload[state.scene].AppId,
-        room_id: payload[state.scene].RoomId,
-        user_id: payload[state.scene].UserId,
-        token: payload[state.scene].Token,
-      };
     },
 
     updateLocalUser: (state, { payload }: { payload: Partial<LocalUser> }) => {
@@ -295,6 +314,39 @@ export const roomSlice = createSlice({
     },
     clearHistoryMsg: (state) => {
       state.msgHistory = [];
+    },
+    setAgentSessionId: (state, { payload }: { payload: string }) => {
+      state.agentSessionId = payload;
+    },
+    beginAgentTrace: (state, { payload }: { payload: { turnId: string; question: string } }) => {
+      state.agentTraceTurns.push({
+        turnId: payload.turnId,
+        question: payload.question,
+        startedAt: Date.now(),
+        events: [],
+      });
+      if (state.agentTraceTurns.length > 10) state.agentTraceTurns.shift();
+    },
+    appendAgentTrace: (state, { payload }: { payload: AgentTraceEvent }) => {
+      const turn = state.agentTraceTurns.find((item) => item.turnId === payload.turn_id);
+      if (turn) {
+        const existing = turn.events.findIndex((item) => item.stage === payload.stage);
+        if (existing >= 0) turn.events[existing] = payload;
+        else turn.events.push(payload);
+        if (['completed', 'failed', 'degraded'].includes(payload.status) && payload.stage === 'answer') {
+          turn.completedAt = Date.now();
+        }
+      }
+    },
+    updateAgentTraceAnswer: (
+      state,
+      { payload }: { payload: { turnId: string; answer: string } }
+    ) => {
+      const turn = state.agentTraceTurns.find((item) => item.turnId === payload.turnId);
+      if (turn) turn.answer = payload.answer;
+    },
+    clearAgentTraceTurns: (state) => {
+      state.agentTraceTurns = [];
     },
     setHistoryMsg: (state, { payload }) => {
       const { paragraph, definite } = payload;
@@ -405,6 +457,11 @@ export const {
   updateAIThinkState,
   setHistoryMsg,
   clearHistoryMsg,
+  setAgentSessionId,
+  beginAgentTrace,
+  appendAgentTrace,
+  updateAgentTraceAnswer,
+  clearAgentTraceTurns,
   clearCurrentMsg,
   setInterruptMsg,
   updateNetworkQuality,

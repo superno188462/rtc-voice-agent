@@ -9,7 +9,9 @@ import { useDispatch, useSelector } from 'react-redux';
 import { StreamIndex } from '@volcengine/rtc';
 import { RootState } from '@/store';
 import RtcClient from '@/lib/RtcClient';
+import { closeTtsAudioContext, getTtsAudioContext } from '@/lib/ttsAudio';
 import { AIGC_PROXY_HOST } from '@/config';
+import { AgentEvent as ApiAgentEvent, streamAgentTurn } from '@/lib/agentApi';
 import {
   clearHistoryMsg,
   setHistoryMsg,
@@ -18,14 +20,21 @@ import {
   updateASRStatus,
   updateAIThinkState,
   updateAITalkState,
+  beginAgentTrace,
+  appendAgentTrace,
+  setAgentSessionId,
+  updateAgentTraceAnswer,
 } from '@/store/slices/room';
 
-type AgentEvent = {
-  type: string;
-  text?: string;
-  code?: string;
+type AgentEvent = ApiAgentEvent & {
   utterance_id?: string;
-  turn_id?: string;
+  request_id?: string;
+  /** ASR 上游连接代次；静默回收后的新连接会递增。 */
+  generation?: number;
+  /** asr_ready 是否表示一次空闲回收后的重连。 */
+  reconnected?: boolean;
+  /** 错误已经提示时，用于静默清理未完成轮次，避免重复 toast。 */
+  suppress_warning?: boolean;
 };
 type VoiceTurn = {
   turnId: string;
@@ -51,6 +60,9 @@ function getAgentErrorMessage(code: string): string {
 
 const VAD_RMS_THRESHOLD = 0.012;
 const VAD_SILENCE_MS = 600;
+// 保留开口前及静音判停后的少量 PCM，避免 VAD 阈值切掉辅音或 ASR 判停尾音。
+const VAD_PRE_ROLL_MS = 200;
+const VAD_TRAILING_SILENCE_MS = 1000;
 
 function logVoiceTrace(event: string, turnId: string, details: Record<string, unknown> = {}) {
   console.info(
@@ -82,59 +94,30 @@ async function readLlmTurn(
   turnId: string,
   onEvent: (event: AgentEvent) => void,
   asrFinalAt: number,
-  speechStartAt?: number
+  speechStartAt?: number,
+  speechEndAt?: number
 ): Promise<void> {
   const clientStartedAt = performance.now();
   let firstTextAt: number | undefined;
   logVoiceTrace('llm_client_request_start', turnId, {
     asr_final_to_request_ms: Math.round(clientStartedAt - asrFinalAt),
   });
-  const response = await fetch(
-    `${AIGC_PROXY_HOST}/api/agent/sessions/${sessionId}/turns`,
-    {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, turn_id: turnId }),
+  await streamAgentTurn(sessionId, text, turnId, (event) => {
+    if (event.type === 'text_delta' && event.text && firstTextAt === undefined) {
+      firstTextAt = performance.now();
+      logVoiceTrace('llm_client_first_text', turnId, {
+        elapsed_ms: Math.round(firstTextAt - clientStartedAt),
+        asr_final_to_first_text_ms: Math.round(firstTextAt - asrFinalAt),
+        speech_start_to_client_first_text_ms:
+          speechStartAt === undefined ? null : Math.round(firstTextAt - speechStartAt),
+        speech_end_to_client_first_text_ms:
+          speechEndAt === undefined ? null : Math.round(firstTextAt - speechEndAt),
+      });
     }
-  );
-  if (!response.ok || !response.body) {
-    throw new Error(`LLM request failed (${response.status})`);
-  }
-  logVoiceTrace('llm_client_response_headers', turnId, {
-    elapsed_ms: Math.round(performance.now() - clientStartedAt),
+    onEvent(event as AgentEvent);
+  }, true, (elapsedMs) => {
+    logVoiceTrace('llm_client_response_headers', turnId, { elapsed_ms: elapsedMs });
   });
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  // The SSE stream remains open until the server emits its terminal event.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    // SSE is a live stream, so each read intentionally waits for the next frame.
-    // eslint-disable-next-line no-await-in-loop
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-    const frames = buffer.split('\n\n');
-    buffer = frames.pop() || '';
-    frames.forEach((frame) => {
-      const line = frame.split('\n').find((item) => item.startsWith('data:'));
-      if (line) {
-        const event = JSON.parse(line.slice(5).trim()) as AgentEvent;
-        if (event.type === 'error') throw new Error(event.code || 'LLM_REQUEST_FAILED');
-        if (event.type === 'text_delta' && event.text && firstTextAt === undefined) {
-          firstTextAt = performance.now();
-          logVoiceTrace('llm_client_first_text', turnId, {
-            elapsed_ms: Math.round(firstTextAt - clientStartedAt),
-            speech_start_to_client_first_text_ms:
-              speechStartAt === undefined ? null : Math.round(firstTextAt - speechStartAt),
-          });
-        }
-        onEvent(event);
-      }
-    });
-    if (done) break;
-  }
   logVoiceTrace('llm_client_stream_end', turnId, {
     elapsed_ms: Math.round(performance.now() - clientStartedAt),
   });
@@ -178,6 +161,13 @@ export default function useMockAgent(): void {
   publishAudioRef.current = Boolean(room.localUser.publishAudio);
   botNameRef.current = room.sceneConfigMap[room.scene]?.botName || 'assistant';
 
+  useEffect(
+    () => () => {
+      void closeTtsAudioContext();
+    },
+    []
+  );
+
   useEffect(() => {
     let cancelled = false;
     let createdSessionId = '';
@@ -189,7 +179,17 @@ export default function useMockAgent(): void {
     let activeSpeechTurn: VoiceTurn | null = null;
     let silenceMs = 0;
     let silenceStartedAt: number | undefined;
+    let trailingSilenceMs = 0;
+    let forwardingSpeechAudio = false;
+    let forwardedAudioMs = 0;
+    let forwardedAudioBytes = 0;
+    let suppressedAudioMs = 0;
+    let suppressedAudioBytes = 0;
+    let lastSuppressedLogAt = 0;
+    const preRollFrames: Array<{ pcm: ArrayBuffer; durationMs: number }> = [];
+    let preRollMs = 0;
     const pendingSpeechTurns: VoiceTurn[] = [];
+    if (!room.isJoined) void closeTtsAudioContext();
     const disableAudioCallback = () => {
       if (RtcClient.engine) {
         RtcClient.engine.setAudioFrameCallback(StreamIndex.STREAM_INDEX_MAIN, undefined, undefined);
@@ -200,28 +200,36 @@ export default function useMockAgent(): void {
       if (!room.isJoined || !room.roomId || !room.localUser.userId) return;
       dispatch(updateASRStatus('connecting'));
       try {
-        const response = await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            scene_id: room.scene,
-            room_id: room.roomId,
-            user_id: room.localUser.userId,
-          }),
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data?.error?.code || `HTTP ${response.status}`);
-        createdSessionId = data.session_id;
-        if (cancelled) {
-          await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions/${createdSessionId}`, {
-            method: 'DELETE',
+        const reuseTextSession = Boolean(room.agentSessionId);
+        if (reuseTextSession) {
+          createdSessionId = room.agentSessionId;
+        } else {
+          const response = await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions`, {
+            method: 'POST',
             credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              scene_id: room.scene,
+              room_id: room.roomId,
+              user_id: room.localUser.userId,
+            }),
           });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data?.error?.code || `HTTP ${response.status}`);
+          createdSessionId = data.session_id;
+        }
+        if (cancelled) {
+          if (!reuseTextSession) {
+            await fetch(`${AIGC_PROXY_HOST}/api/agent/sessions/${createdSessionId}`, {
+              method: 'DELETE',
+              credentials: 'include',
+            });
+          }
           return;
         }
 
         sessionId.current = createdSessionId;
+        dispatch(setAgentSessionId(createdSessionId));
         dispatch(clearHistoryMsg());
         try {
           const historyResponse = await fetch(
@@ -291,6 +299,28 @@ export default function useMockAgent(): void {
                     const now = performance.now();
                     const frameDurationMs = (pcm.byteLength / 2 / 16000) * 1000;
                     const rms = getPcmRms(pcm);
+                    const sendPcm = (chunk: ArrayBuffer) => {
+                      if (localSocket?.readyState !== WebSocket.OPEN) return;
+                      localSocket.send(chunk);
+                      audioFramesSent += 1;
+                      const chunkDurationMs = (chunk.byteLength / 2 / 16000) * 1000;
+                      forwardedAudioMs += chunkDurationMs;
+                      forwardedAudioBytes += chunk.byteLength;
+                      if (audioFramesSent === 1) {
+                        if (audioWatchdog) window.clearTimeout(audioWatchdog);
+                        audioWatchdog = undefined;
+                        if (asrReady) dispatch(updateASRStatus('listening'));
+                      }
+                    };
+                    let resumedSpeech = false;
+                    if (!activeSpeechTurn) {
+                      preRollFrames.push({ pcm, durationMs: frameDurationMs });
+                      preRollMs += frameDurationMs;
+                      while (preRollMs > VAD_PRE_ROLL_MS && preRollFrames.length > 1) {
+                        const removed = preRollFrames.shift();
+                        if (removed) preRollMs -= removed.durationMs;
+                      }
+                    }
                     if (!activeSpeechTurn && rms >= VAD_RMS_THRESHOLD) {
                       const turnId =
                         typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -298,11 +328,24 @@ export default function useMockAgent(): void {
                           : `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
                       activeSpeechTurn = { turnId, speechStartAt: now };
                       pendingSpeechTurns.push(activeSpeechTurn);
+                      resumedSpeech = !forwardingSpeechAudio;
+                      forwardingSpeechAudio = true;
+                      trailingSilenceMs = 0;
+                      if (resumedSpeech) {
+                        logVoiceTrace('speech_audio_resumed', turnId, {
+                          forwarded_audio_ms: Math.round(forwardedAudioMs),
+                          forwarded_audio_bytes: forwardedAudioBytes,
+                        });
+                      }
+                      preRollFrames.forEach(({ pcm: bufferedPcm }) => sendPcm(bufferedPcm));
+                      preRollFrames.length = 0;
+                      preRollMs = 0;
                       silenceMs = 0;
                       silenceStartedAt = undefined;
                       logVoiceTrace('speech_start', turnId, { vad_rms: Number(rms.toFixed(4)) });
                       sendTraceMarker('speech_start', turnId);
                     } else if (activeSpeechTurn && rms < VAD_RMS_THRESHOLD) {
+                      trailingSilenceMs += frameDurationMs;
                       if (silenceStartedAt === undefined) silenceStartedAt = now;
                       silenceMs += frameDurationMs;
                       if (silenceMs >= VAD_SILENCE_MS) {
@@ -316,20 +359,53 @@ export default function useMockAgent(): void {
                           vad_hangover_ms: Math.round(now - silenceStartedAt),
                         });
                         sendTraceMarker('speech_end', activeSpeechTurn.turnId);
+                        const completedTurnId = activeSpeechTurn.turnId;
                         activeSpeechTurn = null;
                         silenceMs = 0;
                         silenceStartedAt = undefined;
+                        if (trailingSilenceMs >= VAD_TRAILING_SILENCE_MS) {
+                          forwardingSpeechAudio = false;
+                          logVoiceTrace('silence_audio_paused', completedTurnId, {
+                            trailing_silence_ms: Math.round(trailingSilenceMs),
+                            forwarded_audio_ms: Math.round(forwardedAudioMs),
+                          });
+                        }
                       }
                     } else if (activeSpeechTurn) {
                       silenceMs = 0;
                       silenceStartedAt = undefined;
+                      trailingSilenceMs = 0;
+                    } else if (forwardingSpeechAudio && rms < VAD_RMS_THRESHOLD) {
+                      trailingSilenceMs += frameDurationMs;
+                      if (trailingSilenceMs >= VAD_TRAILING_SILENCE_MS) {
+                        forwardingSpeechAudio = false;
+                        const lastTurnId = pendingSpeechTurns[pendingSpeechTurns.length - 1]?.turnId;
+                        if (lastTurnId) {
+                          logVoiceTrace('silence_audio_paused', lastTurnId, {
+                            trailing_silence_ms: Math.round(trailingSilenceMs),
+                            forwarded_audio_ms: Math.round(forwardedAudioMs),
+                          });
+                        }
+                      }
                     }
-                    localSocket.send(pcm);
-                    audioFramesSent += 1;
-                    if (audioFramesSent === 1) {
-                      if (audioWatchdog) window.clearTimeout(audioWatchdog);
-                      audioWatchdog = undefined;
-                      if (asrReady) dispatch(updateASRStatus('listening'));
+
+                    if (resumedSpeech) {
+                      // 活跃轮次分支在恢复语音时已发送预录音，避免当前帧重复发送。
+                    } else if (activeSpeechTurn || forwardingSpeechAudio) {
+                      sendPcm(pcm);
+                    } else {
+                      suppressedAudioMs += frameDurationMs;
+                      suppressedAudioBytes += pcm.byteLength;
+                      if (now - lastSuppressedLogAt >= 5000) {
+                        lastSuppressedLogAt = now;
+                        const lastTurnId = pendingSpeechTurns[pendingSpeechTurns.length - 1]?.turnId;
+                        logVoiceTrace('silence_pcm_suppressed', lastTurnId || 'idle', {
+                          suppressed_audio_ms: Math.round(suppressedAudioMs),
+                          suppressed_audio_bytes: suppressedAudioBytes,
+                          forwarded_audio_ms: Math.round(forwardedAudioMs),
+                          forwarded_audio_bytes: forwardedAudioBytes,
+                        });
+                      }
                     }
                   }
                 }
@@ -355,10 +431,43 @@ export default function useMockAgent(): void {
             return;
           }
           if (event.type === 'error') {
-            Message.error(`ASR 连接失败：${event.code || 'ASR_UPSTREAM_FAILED'}`);
+            if (event.turn_id) {
+              const failedTurnIndex = pendingSpeechTurns.findIndex(
+                (turn) => turn.turnId === event.turn_id
+              );
+              if (failedTurnIndex >= 0) pendingSpeechTurns.splice(failedTurnIndex, 1);
+            }
+            logVoiceTrace('asr_upstream_error', event.turn_id || 'unassigned', {
+              code: event.code || 'ASR_UPSTREAM_FAILED',
+              request_id: event.request_id,
+              generation: event.generation,
+              message: event.message,
+            });
+            Message.error(
+              `ASR 连接失败：${event.code || 'ASR_UPSTREAM_FAILED'}${
+                event.message ? `（${event.message}）` : ''
+              }`
+            );
             dispatch(updateASRStatus('error'));
             dispatch(updateAIGCState({ isAIGCEnable: false }));
             dispatch(updateASRPartialText(''));
+            return;
+          }
+          if (event.type === 'asr_turn_incomplete') {
+            if (event.turn_id) {
+              const pendingIndex = pendingSpeechTurns.findIndex(
+                (turn) => turn.turnId === event.turn_id
+              );
+              if (pendingIndex >= 0) pendingSpeechTurns.splice(pendingIndex, 1);
+              logVoiceTrace('asr_turn_incomplete', event.turn_id, {
+                code: event.code,
+                generation: event.generation,
+              });
+            }
+            dispatch(updateASRPartialText(''));
+            if (!event.suppress_warning) {
+              Message.warning('这句话的语音识别未能完成，请再说一次。');
+            }
             return;
           }
           if (event.type === 'asr_ready') {
@@ -391,12 +500,32 @@ export default function useMockAgent(): void {
             }
             if (event.utterance_id) processedFinalUtteranceIds.current.add(event.utterance_id);
             const finalizedAt = performance.now();
-            const pendingTurnIndex = event.turn_id
+            const reportedTurnIndex = event.turn_id
               ? pendingSpeechTurns.findIndex((turn) => turn.turnId === event.turn_id)
-              : 0;
+              : -1;
+            const hasReportedTurn = reportedTurnIndex >= 0;
+            const shouldUseOldestPending =
+              !hasReportedTurn && pendingSpeechTurns.length > 0;
+            const pendingTurnIndex = hasReportedTurn
+              ? reportedTurnIndex
+              : shouldUseOldestPending
+                ? 0
+                : -1;
             const speechTurn =
               pendingTurnIndex >= 0 ? pendingSpeechTurns.splice(pendingTurnIndex, 1)[0] : undefined;
-            const turnId = event.turn_id || speechTurn?.turnId || `asr-${Date.now()}`;
+            const turnId = speechTurn?.turnId || event.turn_id || `asr-${Date.now()}`;
+            if (event.turn_id && speechTurn && event.turn_id !== speechTurn.turnId) {
+              logVoiceTrace('asr_turn_id_mismatch', turnId, {
+                reported_turn_id: event.turn_id,
+                selected_turn_id: speechTurn.turnId,
+                generation: event.generation,
+                pending_turn_count: pendingSpeechTurns.length + 1,
+              });
+            }
+            // Use the client-selected voice turn as the trace authority. The server
+            // may have assigned a stale/unmatched upstream ID; this marker repairs
+            // the backend trace without changing the ASR text or request payload.
+            sendTraceMarker('asr_final', turnId);
             logVoiceTrace('asr_final', turnId, {
               utterance_id: event.utterance_id,
               speech_to_final_ms: speechTurn
@@ -413,24 +542,108 @@ export default function useMockAgent(): void {
             const botName = botNameRef.current;
             const finalText = event.text;
             const turnSessionId = createdSessionId;
+            dispatch(beginAgentTrace({ turnId, question: finalText }));
             turnQueue.current = turnQueue.current
               .then(async () => {
                 llmBusy.current = true;
                 let answer = '';
+                let answerFinalized = false;
+                let ttsNextPlaybackAt = 0;
+                let ttsHadAudio = false;
+                let ttsErrorShown = false;
+                let pcmCarry = new Uint8Array(0);
                 dispatch(updateAIThinkState({ isAIThinking: true }));
                 await readLlmTurn(turnSessionId, finalText, turnId, (llmEvent) => {
-                  if (llmEvent.type === 'text_delta' && llmEvent.text) {
+                  if (llmEvent.type === 'trace') {
+                    dispatch(appendAgentTrace({
+                      type: 'trace',
+                      turn_id: llmEvent.turn_id || turnId,
+                      stage: llmEvent.stage || 'unknown',
+                      status: llmEvent.status || 'running',
+                      summary: llmEvent.summary || '',
+                      details: llmEvent.details,
+                      at: llmEvent.at,
+                    }));
+                  } else if (llmEvent.type === 'text_delta' && llmEvent.text) {
                     answer += llmEvent.text;
+                    dispatch(updateAgentTraceAnswer({ turnId, answer }));
                     dispatch(
                       setHistoryMsg({ text: answer, user: botName, paragraph: false, definite: false })
                     );
+                  } else if (llmEvent.type === 'llm_done') {
+                    if (answer) {
+                      dispatch(updateAgentTraceAnswer({ turnId, answer }));
+                      dispatch(
+                        setHistoryMsg({ text: answer, user: botName, paragraph: true, definite: true })
+                      );
+                      answerFinalized = true;
+                    }
+                  } else if (llmEvent.type === 'audio_chunk' && llmEvent.audio_base64) {
+                    try {
+                      const binary = window.atob(llmEvent.audio_base64);
+                      const incoming = new Uint8Array(binary.length);
+                      for (let index = 0; index < binary.length; index += 1) {
+                        incoming[index] = binary.charCodeAt(index);
+                      }
+                      const combined = new Uint8Array(pcmCarry.length + incoming.length);
+                      combined.set(pcmCarry);
+                      combined.set(incoming, pcmCarry.length);
+                      const playableLength = combined.length - (combined.length % 2);
+                      pcmCarry = combined.slice(playableLength);
+                      if (!playableLength) return;
+
+                      const sampleRate = llmEvent.sample_rate || 24000;
+                      const sampleCount = playableLength / 2;
+                      const audioContext = getTtsAudioContext();
+                      void audioContext.resume().catch(() => undefined);
+                      const audioBuffer = audioContext.createBuffer(1, sampleCount, sampleRate);
+                      const channel = audioBuffer.getChannelData(0);
+                      const view = new DataView(combined.buffer, combined.byteOffset, playableLength);
+                      for (let index = 0; index < sampleCount; index += 1) {
+                        channel[index] = view.getInt16(index * 2, true) / 32768;
+                      }
+                      const source = audioContext.createBufferSource();
+                      source.buffer = audioBuffer;
+                      source.connect(audioContext.destination);
+                      const startAt = Math.max(audioContext.currentTime + 0.04, ttsNextPlaybackAt);
+                      source.start(startAt);
+                      ttsNextPlaybackAt = startAt + audioBuffer.duration;
+                      if (!ttsHadAudio) {
+                        ttsHadAudio = true;
+                        dispatch(updateAITalkState({ isAITalking: true }));
+                        logVoiceTrace('tts_playback_start', turnId, {
+                          elapsed_ms: Math.round(performance.now() - finalizedAt),
+                        });
+                      }
+                    } catch (error) {
+                      logVoiceTrace('tts_audio_decode_failed', turnId, {
+                        error: error instanceof Error ? error.name : 'UnknownError',
+                      });
+                    }
+                  } else if (llmEvent.type === 'tts_error') {
+                    logVoiceTrace('tts_failed', turnId, { code: llmEvent.code || 'TTS_FAILED' });
+                    if (!ttsErrorShown) {
+                      ttsErrorShown = true;
+                      Message.warning('火山语音合成失败，文字回复已保留。');
+                    }
                   }
-                }, finalizedAt, speechTurn?.speechStartAt);
-                logVoiceTrace('tts_not_enabled', turnId, { status: 'not_implemented' });
-                if (answer) {
+                }, finalizedAt, speechTurn?.speechStartAt, speechTurn?.speechEndAt);
+                if (answer && !answerFinalized) {
                   dispatch(
                     setHistoryMsg({ text: answer, user: botName, paragraph: true, definite: true })
                   );
+                }
+                if (answer) {
+                  const audioContext = getTtsAudioContext();
+                  if (ttsHadAudio && ttsNextPlaybackAt > audioContext.currentTime) {
+                    await new Promise((resolve) => {
+                      window.setTimeout(
+                        resolve,
+                        Math.ceil((ttsNextPlaybackAt - audioContext.currentTime) * 1000)
+                      );
+                    });
+                    logVoiceTrace('tts_playback_end', turnId);
+                  }
                 }
               })
               .catch((error) => {
@@ -470,6 +683,7 @@ export default function useMockAgent(): void {
     if (!room.isJoined && sessionId.current) {
       const previousSessionId = sessionId.current;
       sessionId.current = '';
+      dispatch(setAgentSessionId(''));
       llmBusy.current = false;
       processedFinalUtteranceIds.current.clear();
       pendingSpeechTurns.length = 0;

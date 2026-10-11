@@ -131,7 +131,8 @@ app.use(async ctx => {
   });
 });
 
-app.listen(3001, () => {
-  console.log('AIGC Server is running at http://localhost:3001');
+const port = Number(process.env.PORT || 8000);
+app.listen(port, () => {
+  console.log(`AIGC Server is running at http://localhost:${port}`);
 });
 

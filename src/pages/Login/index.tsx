@@ -128,7 +128,7 @@ export default function LoginPage() {
           </Button>
         </div>
       </section>
-      <footer className={styles.footer}>账号由当前 RTC Agent 项目管理</footer>
+      <footer className={styles.footer}>账号由身份中心统一管理</footer>
     </main>
   );
 }

@@ -8,10 +8,9 @@ export const ReversoContext = 'https://www.volcengine.com/docs/6348/68918';
 export const UserAgreement = 'https://www.volcengine.com/docs/6348/128955';
 
 /**
- * @note 请求的 API Proxy Server(对应此 Demo 中包含的 Node server) 地址。
- *       您可按需改成自己需要访问的地址。
+ * @note 请求后端 API 的地址，可通过 REACT_APP_API_HOST 配置。
  */
-export const AIGC_PROXY_HOST = 'http://localhost:3001';
+export const AIGC_PROXY_HOST = process.env.REACT_APP_API_HOST || 'http://localhost:8002';
 
 export interface IScene {
   icon: string;

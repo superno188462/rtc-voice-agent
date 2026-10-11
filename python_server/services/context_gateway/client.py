@@ -7,6 +7,10 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from gateway_client import GatewayContextError as _GatewayContextError
+
+from services.gateway import create_gateway_client
+from services.context_gateway.templates import ANSWER_TEMPLATE_CATEGORY, ANSWER_TEMPLATE_NAME
 
 
 class ContextGatewayError(RuntimeError):
@@ -18,8 +22,26 @@ class ContextGatewayError(RuntimeError):
         super().__init__(code)
 
 
+def _normalize_sdk_error(error: _GatewayContextError) -> ContextGatewayError:
+    """Keep this project's established error codes while exposing SDK failures."""
+
+    code = {
+        "GATEWAY_CONTEXT_VERSION_CONFLICT": "CONTEXT_VERSION_CONFLICT",
+        "GATEWAY_API_KEY_INVALID": "CONTEXT_AUTH_FAILED",
+        "GATEWAY_CONTEXT_ACCESS_DENIED": "CONTEXT_AUTH_FAILED",
+        "GATEWAY_CONTEXT_NOT_FOUND": "CONTEXT_RESOURCE_NOT_FOUND",
+        "GATEWAY_BASE_URL_NOT_CONFIGURED": "CONTEXT_SERVICE_NOT_CONFIGURED",
+        "GATEWAY_CONTEXT_TIMEOUT": "CONTEXT_SERVICE_TIMEOUT",
+        "GATEWAY_CONTEXT_NETWORK_ERROR": "CONTEXT_SERVICE_NETWORK_ERROR",
+    }.get(error.code, error.code)
+    return ContextGatewayError(code, error.status_code)
+
+
 class ContextGatewayClient:
-    """封装提示词模板、短期消息、长期记忆和用户画像接口。"""
+    """业务适配层：已由 SDK 覆盖的 Context 操作统一委托 SDK。
+
+    模板读写和短期消息追加当前尚未由 SDK 封装，暂留在本适配层的兼容请求中。
+    """
 
     def __init__(
         self,
@@ -27,9 +49,16 @@ class ContextGatewayClient:
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self.base_url = (base_url if base_url is not None else os.getenv("GATEWAY_CONTEXT_BASE_URL", "")).strip().rstrip("/")
-        self.api_key = api_key if api_key is not None else os.getenv("GATEWAY_PROJECT_API_KEY", "")
         self.transport = transport
+        self._sdk = create_gateway_client(
+            base_url=base_url,
+            api_key=api_key,
+            transport=transport,
+        )
+        # Reuse the SDK-normalized API root and credential for the few context
+        # routes not exposed by the current SDK (templates and message append).
+        self.base_url = f"{self._sdk.context.base_url}/context"
+        self.api_key = self._sdk.context.api_key
 
     def _configuration(self) -> tuple[str, str]:
         if not self.base_url or not self.api_key:
@@ -83,44 +112,88 @@ class ContextGatewayClient:
         except ValueError as exc:
             raise ContextGatewayError("CONTEXT_INVALID_RESPONSE", response.status_code) from exc
 
-    async def get_template(self) -> str:
-        """读取当前配置的项目 system 模板，未配置或未找到时明确失败。"""
+    async def get_template(
+        self,
+        category: str = ANSWER_TEMPLATE_CATEGORY,
+        name: str = ANSWER_TEMPLATE_NAME,
+    ) -> str:
+        """Read a project template by the stable category/name contract."""
 
-        template_id = os.getenv("GATEWAY_CONTEXT_TEMPLATE_ID", "").strip()
-        if template_id:
-            path = f"/templates/by-id/{quote(template_id, safe='')}"
-        else:
-            category = os.getenv("GATEWAY_CONTEXT_TEMPLATE_CATEGORY", "system").strip()
-            name = os.getenv("GATEWAY_CONTEXT_TEMPLATE_NAME", "agent").strip()
-            path = f"/templates/{quote(category, safe='')}/{quote(name, safe='')}"
-        result = await self._request("GET", path)
-        body = result
-        if isinstance(body, dict) and isinstance(body.get("data"), dict):
-            body = body["data"]
-        if isinstance(body, dict):
-            body = body.get("template", body)
-        if isinstance(body, dict):
-            content = body.get("content") or body.get("template_content") or body.get("prompt")
-        else:
-            content = body
-        if not isinstance(content, str) or not content.strip():
+        result = await self.get_template_resource(category, name)
+        content = _template_content(result)
+        if not content:
             raise ContextGatewayError("CONTEXT_TEMPLATE_INVALID")
         return content
+
+    async def get_template_resource(self, category: str, name: str) -> Any:
+        """Fetch one Gateway template resource without interpreting its content."""
+
+        path = f"/templates/{quote(category, safe='')}/{quote(name, safe='')}"
+        return await self._request("GET", path)
+
+    async def ensure_template(self, category: str, name: str, content: str) -> str:
+        """Create or synchronize one Gateway prompt with the local seed.
+
+        Existing Gateway templates are updated only when their content differs.
+        Updates use the version read from Gateway; on a conflict we reread once
+        and retry only if the latest content still differs from the seed.
+        """
+
+        try:
+            resource = await self.get_template_resource(category, name)
+        except ContextGatewayError as exc:
+            if exc.status_code != 404:
+                raise
+            try:
+                await self._request(
+                    "POST",
+                    "/templates",
+                    json_body={"category": category, "name": name, "content": content},
+                )
+                return "created"
+            except ContextGatewayError as create_exc:
+                if create_exc.status_code != 409:
+                    raise
+                # Another instance may have created the named template first.
+                resource = await self.get_template_resource(category, name)
+
+        if _template_content(resource) == content.strip():
+            return "unchanged"
+
+        for attempt in range(2):
+            template_id, version = _template_identity(resource)
+            try:
+                await self._request(
+                    "PATCH",
+                    f"/templates/{quote(template_id, safe='')}",
+                    json_body={
+                        "expected_version": version,
+                        "name": name,
+                        "content": content,
+                    },
+                )
+                return "updated"
+            except ContextGatewayError as exc:
+                if exc.status_code != 409 or attempt:
+                    raise
+                resource = await self.get_template_resource(category, name)
+                if _template_content(resource) == content.strip():
+                    return "unchanged"
+        raise ContextGatewayError("CONTEXT_TEMPLATE_UPDATE_FAILED")
 
     async def get_messages(self, external_user_id: str, session_id: str, limit: int = 50) -> list[dict[str, str]]:
         """读取会话最近消息；最多读取 API 允许的 100 条。"""
 
         try:
-            result = await self._request(
-                "GET",
-                f"/users/{quote(external_user_id, safe='')}/sessions/{quote(session_id, safe='')}/messages",
-                params={"limit": min(100, max(1, limit))},
+            result = await self._sdk.context.list_session_messages(
+                external_user_id, session_id, min(100, max(1, limit))
             )
-        except ContextGatewayError as exc:
+        except _GatewayContextError as error:
+            exc = _normalize_sdk_error(error)
             # A never-used short-term session may have no message resource yet.
             if exc.status_code == 404:
                 return []
-            raise
+            raise exc from error
         raw = _list_payload(result, ("messages", "items"))
         return [
             {"role": item["role"], "content": item["content"]}
@@ -145,11 +218,12 @@ class ContextGatewayClient:
     async def get_memory_page(self, external_user_id: str, page: int, page_size: int = 50) -> Any:
         """读取一页用户级长期记忆。"""
 
-        return await self._request(
-            "GET",
-            f"/users/{quote(external_user_id, safe='')}/memories",
-            params={"page": page, "page_size": min(100, max(1, page_size))},
-        )
+        try:
+            return await self._sdk.context.list_memories(
+                external_user_id, page, min(100, max(1, page_size))
+            )
+        except _GatewayContextError as error:
+            raise _normalize_sdk_error(error) from error
 
     async def create_memory(
         self,
@@ -160,11 +234,10 @@ class ContextGatewayClient:
     ) -> Any:
         """保存用户明确要求记住的稳定偏好或事实。"""
 
-        return await self._request(
-            "POST",
-            f"/users/{quote(external_user_id, safe='')}/memories",
-            json_body={"content": content, "tags": tags, "metadata": metadata},
-        )
+        try:
+            return await self._sdk.context.create_memory(external_user_id, content, tags, metadata)
+        except _GatewayContextError as error:
+            raise _normalize_sdk_error(error) from error
 
     async def update_memory(
         self,
@@ -177,33 +250,33 @@ class ContextGatewayClient:
     ) -> Any:
         """Update one existing long-term memory using optimistic version control."""
 
-        return await self._request(
-            "PATCH",
-            f"/users/{quote(external_user_id, safe='')}/memories/{quote(memory_id, safe='')}",
-            json_body={
-                "content": content,
-                "tags": tags,
-                "metadata": metadata,
-                "expected_version": expected_version,
-            },
-        )
+        try:
+            return await self._sdk.context.update_memory(
+                external_user_id,
+                memory_id,
+                expected_version=expected_version,
+                content=content,
+                tags=tags,
+                metadata=metadata,
+            )
+        except _GatewayContextError as error:
+            raise _normalize_sdk_error(error) from error
 
     async def get_profile(self, external_user_id: str) -> tuple[dict[str, Any], int | None]:
         """读取项目定义的当前用户画像及版本号。"""
 
         try:
-            result = await self._request("GET", f"/users/{quote(external_user_id, safe='')}/profile")
-        except ContextGatewayError as exc:
+            result = await self._sdk.context.get_profile(external_user_id)
+        except _GatewayContextError as error:
+            exc = _normalize_sdk_error(error)
             # A new account has no profile until the first explicit preference is saved.
             if exc.status_code == 404:
                 return {}, None
-            raise
-        body = result.get("data", result) if isinstance(result, dict) else {}
-        if isinstance(body, dict):
-            body = body.get("profile", body)
+            raise exc from error
+        body = result.get("profile", {}) if isinstance(result, dict) else {}
         if not isinstance(body, dict):
             raise ContextGatewayError("CONTEXT_PROFILE_INVALID")
-        version_source = result.get("data", result) if isinstance(result, dict) else {}
+        version_source = result
         version = (
             version_source.get("version", version_source.get("profile_version"))
             if isinstance(version_source, dict)
@@ -216,12 +289,10 @@ class ContextGatewayClient:
     ) -> Any:
         """创建画像或按最近读取版本替换；冲突由调用方重新读取并合并。"""
 
-        body: dict[str, Any] = {"profile": profile}
-        if expected_version is not None:
-            body["expected_version"] = expected_version
-        return await self._request(
-            "PUT", f"/users/{quote(external_user_id, safe='')}/profile", json_body=body
-        )
+        try:
+            return await self._sdk.context.put_profile(external_user_id, profile, expected_version)
+        except _GatewayContextError as error:
+            raise _normalize_sdk_error(error) from error
 
 
 def _list_payload(result: Any, keys: tuple[str, ...]) -> list[Any]:
@@ -242,6 +313,40 @@ def _list_payload(result: Any, keys: tuple[str, ...]) -> list[Any]:
             if isinstance(value, list):
                 return value
     return []
+
+
+def _template_content(result: Any) -> str | None:
+    """Extract template content from the current Gateway response envelope."""
+
+    body = result
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    if isinstance(body, dict):
+        body = body.get("template", body)
+    if isinstance(body, dict):
+        content = body.get("content") or body.get("template_content") or body.get("prompt")
+    else:
+        content = body
+    return content.strip() if isinstance(content, str) and content.strip() else None
+
+
+def _template_identity(result: Any) -> tuple[str, int]:
+    """Extract the resource ID and optimistic version required by Gateway PATCH."""
+
+    body = result
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    if isinstance(body, dict):
+        body = body.get("template", body)
+    if not isinstance(body, dict):
+        raise ContextGatewayError("CONTEXT_TEMPLATE_INVALID")
+    template_id = body.get("id", body.get("template_id"))
+    version = body.get("version")
+    if not isinstance(template_id, str) or not template_id.strip():
+        raise ContextGatewayError("CONTEXT_TEMPLATE_INVALID")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ContextGatewayError("CONTEXT_TEMPLATE_INVALID")
+    return template_id, version
 
 
 def get_context_gateway() -> ContextGatewayClient:

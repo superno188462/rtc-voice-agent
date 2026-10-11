@@ -6,8 +6,9 @@
 import { useEffect, useState } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import VERTC, { MediaType } from '@volcengine/rtc';
-import { Modal } from '@arco-design/web-react';
+import { Message, Modal } from '@arco-design/web-react';
 import RtcClient from '@/lib/RtcClient';
+import { unlockTtsAudio } from '@/lib/ttsAudio';
 import {
   clearCurrentMsg,
   clearHistoryMsg,
@@ -164,6 +165,7 @@ export const useGetDevicePermission = () => {
 
 export const useJoin = (): [boolean, () => Promise<void | boolean>] => {
   const devicePermissions = useSelector((state: RootState) => state.device.devicePermissions);
+  const rtcConfig = useSelector((state: RootState) => state.room.rtcConfigMap[state.room.scene]);
 
   const dispatch = useDispatch();
 
@@ -175,6 +177,21 @@ export const useJoin = (): [boolean, () => Promise<void | boolean>] => {
     if (joining) {
       return;
     }
+
+    // 在用户点击加入房间的手势上下文中解锁后续异步 TTS 播放。
+    void unlockTtsAudio().catch(() => undefined);
+
+    if (!rtcConfig?.AppId || !rtcConfig.RoomId || !rtcConfig.UserId || !rtcConfig.Token) {
+      Message.warning('RTC 场景配置尚未加载完成，请稍后重试或刷新页面。');
+      return false;
+    }
+    // 从当前选中的场景明确初始化 RTC 配置，避免场景请求尚未完成时创建空 Engine。
+    RtcClient.basicInfo = {
+      app_id: rtcConfig.AppId,
+      room_id: rtcConfig.RoomId,
+      user_id: rtcConfig.UserId,
+      token: rtcConfig.Token,
+    };
 
     const isSupported = await VERTC.isSupported();
     if (!isSupported) {

@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from services.auth.database import Base
 from services.auth import models  # noqa: F401 - register metadata tables
+from services.rag import models as rag_models  # noqa: F401 - register knowledge tables
+from services.context_gateway import models as context_models  # noqa: F401 - register project registry
 
 config = context.config
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")

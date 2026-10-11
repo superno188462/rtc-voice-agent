@@ -19,12 +19,17 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 async function authRequest(path: string, body?: Record<string, string>): Promise<any> {
-  const response = await fetch(`${AIGC_PROXY_HOST}${path}`, {
-    method: body ? 'POST' : 'GET',
-    credentials: 'include',
-    headers: body ? { 'content-type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${AIGC_PROXY_HOST}${path}`, {
+      method: body ? 'POST' : 'GET',
+      credentials: 'include',
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error('暂时无法连接语音服务，请检查后端地址和网络');
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const code = payload?.detail?.code || payload?.error?.code;
@@ -38,6 +43,9 @@ async function authRequest(path: string, body?: Record<string, string>): Promise
       REGISTRATION_DISABLED: '当前暂不开放注册',
       AUTH_REQUIRED: '请先登录',
       LOGIN_RATE_LIMITED: '登录尝试过于频繁，请稍后再试',
+      IDENTITY_CENTER_UNAVAILABLE: '认证服务暂时不可用，请稍后重试',
+      IDENTITY_CENTER_NOT_CONFIGURED: '认证服务尚未配置，请联系管理员',
+      IDENTITY_CENTER_BAD_RESPONSE: '认证服务响应异常，请稍后重试',
     };
     throw new Error(messages[code] || '服务暂时不可用，请检查后端连接后重试');
   }
@@ -76,8 +84,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await authRequest('/api/auth/logout', {});
-    setUser(null);
+    try {
+      await authRequest('/api/auth/logout', {});
+    } finally {
+      setUser(null);
+    }
   }, []);
 
   const value = useMemo(

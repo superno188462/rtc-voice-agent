@@ -10,7 +10,7 @@
 cd /d/github/课程/sts/python_server
 cp scenes/Custom.json.example scenes/Custom.json
 uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 3001 --reload
+uv run python app.py
 ```
 
 另一个终端运行前端：
@@ -20,7 +20,9 @@ cd /d/github/课程/sts
 npm run dev
 ```
 
-浏览器打开 `http://localhost:3000`，加入 RTC 房间并允许麦克风。配置 ASR API Key 后，说话内容由 Seed ASR 2.0 转写，字幕区再显示固定 mock LLM 回复。该阶段不连接 LLM 网关、不调用火山 Agent，也不合成语音。配置和链路细节见 `python_server/README.md`。
+浏览器打开 `http://localhost:3002`，加入 RTC 房间并允许麦克风。配置 ASR API Key 后，说话内容由 Seed ASR 2.0 转写，字幕区再显示固定 mock LLM 回复。该阶段不连接 LLM 网关、不调用火山 Agent，也不合成语音。配置和链路细节见 `python_server/README.md`。
+
+前端默认端口为 `3002`，后端默认端口为 `8002`。后端可用 `uv run python app.py --port 8001` 指定端口；前端可通过 `PORT=3003 npm run dev` 指定端口（PowerShell 使用 `$env:PORT="3003"; npm run dev`）。如果后端不是 `8002`，前端同时设置 `REACT_APP_API_HOST` 指向新的后端地址。如更改前端端口，请将新来源加入 `python_server/.env` 中的 `CORS_ALLOW_ORIGINS`。详细命令见 `python_server/README.md`。
 
 此 Demo 为简化版本, 如您有 1.5.x 版本 UI 的诉求, 可切换至 1.5.1 分支。
 跑通阶段时, 无须关心代码实现，仅需按需完成 `Server/scenes/*.json` 的场景信息填充即可。

@@ -55,6 +55,6 @@ def _log_summary(turn_id: str, trace: TurnTrace) -> None:
         f"llm_request_to_stream_end_ms={elapsed('llm_request_start', 'llm_stream_end')} "
         f"speech_start_to_first_token_ms={elapsed('speech_start', 'llm_first_token')} "
         f"speech_end_to_first_token_ms={elapsed('speech_end', 'llm_first_token')} "
-        "tts_status=not_implemented"
+        "tts_status=see_client_trace"
     )
     trace.summary_logged = True

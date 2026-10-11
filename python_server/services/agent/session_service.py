@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
 from services.llm import get_llm_service
 from services.rag import get_rag_service
@@ -25,6 +27,23 @@ from services.context_gateway.assembler import (
     message_pair_hash,
     persist_extracted_context_updates,
 )
+from services.context_gateway.project_registry import list_user_projects, resolve_project_ids
+
+
+_QUERY_CONTEXT_MARKERS = re.compile(
+    r"(?:这个|那个|它|他们|她们|前面|上面|刚才|之前|刚刚|这件事|那件事|这部分|那部分|继续|再说|呢[？?。！!]*$|^那(?:么|这样|然后|呢))"
+)
+_CONTEXT_ONLY_QUERIES = {
+    "试一下", "测试一下", "测一下", "继续", "然后呢", "那然后呢", "为什么", "什么意思",
+    "怎么回事", "怎么样", "多少钱", "多少", "多久", "哪一个", "哪个", "怎么做", "怎么办",
+}
+
+
+def _query_needs_contextual_rewrite(text: str) -> bool:
+    """Only spend a query-rewrite LLM call when the utterance depends on prior context."""
+
+    normalized = re.sub(r"[\s，。！？、,.!?；;：:]", "", text).lower()
+    return normalized in _CONTEXT_ONLY_QUERIES or bool(_QUERY_CONTEXT_MARKERS.search(normalized))
 
 
 @dataclass
@@ -92,7 +111,14 @@ class AgentService:
         await self.interrupt(session)
         return True
 
-    async def stream_turn(self, session: AgentSession, text: str, turn_id: str | None = None):
+    async def stream_turn(
+        self,
+        session: AgentSession,
+        text: str,
+        turn_id: str | None = None,
+        *,
+        on_trace: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ):
         """读取 Gateway 上下文，调用 RAG/LLM，并在成功后追加完整轮次。"""
 
         resolved_turn_id = turn_id or secrets.token_urlsafe(24)
@@ -101,6 +127,25 @@ class AgentService:
                 session.conversation_id, asyncio.Lock()
             )
         async with conversation_lock:
+            trace_stage_started: dict[str, float] = {}
+
+            async def trace(stage: str, status: str, summary: str, **details: Any) -> None:
+                now = time.perf_counter()
+                if status == "running":
+                    trace_stage_started[stage] = now
+                elif stage in trace_stage_started:
+                    details.setdefault("duration_ms", round((now - trace_stage_started[stage]) * 1000))
+                if on_trace:
+                    await on_trace({
+                        "type": "trace",
+                        "turn_id": resolved_turn_id,
+                        "stage": stage,
+                        "status": status,
+                        "summary": summary,
+                        "details": details,
+                        "at": time.time(),
+                    })
+
             async with self._memory_tasks_guard:
                 pending_memory_task = self._memory_tasks.get(session.conversation_id)
             if pending_memory_task and not pending_memory_task.done():
@@ -132,8 +177,14 @@ class AgentService:
                 raise ContextGatewayError("CONTEXT_APPEND_UNCERTAIN")
 
             try:
+                await trace("context", "running", "读取系统提示词、用户画像、长期记忆和短期会话")
+                user_projects = await list_user_projects(session.account_id)
                 system_prompt, history, _profile, _memories = await load_context(
-                    gateway, session.account_id, session.conversation_id, text
+                    gateway,
+                    session.account_id,
+                    session.conversation_id,
+                    text,
+                    user_projects=user_projects,
                 )
             except asyncio.CancelledError:
                 await asyncio.shield(mark_turn_failed(session.conversation_id, resolved_turn_id))
@@ -141,9 +192,90 @@ class AgentService:
             except Exception:
                 await mark_turn_failed(session.conversation_id, resolved_turn_id)
                 raise
+            await trace(
+                "context", "completed", "对话上下文已装配",
+                profile_fields=len(_profile) if isinstance(_profile, dict) else 0,
+                long_term_memories=len(_memories),
+                short_term_messages=len(history[-12:]),
+                system_prompt_loaded=bool(system_prompt),
+                profile=_profile,
+                selected_memories=[{
+                    "content": str(memory.get("content") or "")[:500],
+                    "tags": memory.get("tags") if isinstance(memory.get("tags"), list) else [],
+                    "metadata": memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {},
+                } for memory in _memories[:20]],
+                recent_messages=[{
+                    "role": message.get("role"),
+                    "content": str(message.get("content") or "")[:1500],
+                } for message in history[-12:]],
+            )
             history.append({"role": "user", "content": text})
+
+            recent_conversation = [
+                {"role": message["role"], "content": message["content"]}
+                for message in history[-9:-1]
+                if message.get("role") in {"user", "assistant"}
+                and isinstance(message.get("content"), str)
+            ]
+            if _query_needs_contextual_rewrite(text):
+                await trace("subquery", "running", "问题包含上下文指代，调用子查询 LLM 消解后再检索")
+                try:
+                    search_query = await get_llm_service().rewrite_search_query(
+                        text, recent_conversation, turn_id=resolved_turn_id
+                    )
+                    await trace("subquery", "completed", "已生成向量检索问题", query=search_query)
+                except asyncio.CancelledError:
+                    await asyncio.shield(mark_turn_failed(session.conversation_id, resolved_turn_id))
+                    raise
+                except Exception as exc:
+                    search_query = text
+                    error_code = str(exc)
+                    if not error_code.startswith("SUBQUERY_"):
+                        error_code = type(exc).__name__
+                    await trace(
+                        "subquery", "degraded", "子查询改写失败，使用用户原问题检索",
+                        error=error_code, query=search_query,
+                    )
+            else:
+                search_query = text
+                await trace(
+                    "subquery", "skipped", "问题可直接用于向量检索，已跳过子查询 LLM",
+                    query=search_query,
+                    reason="no_context_reference",
+                )
+
+            rag_context = ""
+            retrieval_hits: list[dict[str, Any]] = []
+            await trace("retrieval", "running", "正在查询 Gateway 向量索引")
             try:
-                rag_context = await get_rag_service().search(text)
+                retrieval_hits = await get_rag_service().search_hits(
+                    search_query,
+                    top_k=int(os.getenv("RAG_TOP_K", "5")),
+                )
+                rag_blocks: list[str] = []
+                for rank, hit in enumerate(retrieval_hits, start=1):
+                    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+                    source = metadata.get("path") or metadata.get("source") or hit.get("title") or "知识库"
+                    parent_content = str(hit.get("parent_content") or "").strip()
+                    child_content = str(hit.get("content") or "").strip()
+                    evidence = parent_content or child_content
+                    if evidence:
+                        rag_blocks.append(f"[检索结果 {rank} | {source}]\n{evidence}")
+                rag_context = "\n\n".join(dict.fromkeys(rag_blocks))
+                await trace(
+                    "retrieval", "completed", f"Gateway 返回 {len(retrieval_hits)} 条向量命中",
+                    result_count=len(retrieval_hits),
+                    hits=[{
+                        "id": str(hit.get("chunk_id") or ""),
+                        "title": str(hit.get("title") or ""),
+                        "content": str(hit.get("content") or "")[:4000],
+                        "parent_id": hit.get("parent_id"),
+                        "parent_content": str(hit.get("parent_content") or "")[:8000],
+                        "context_status": hit.get("context_status"),
+                        "score": hit.get("score"),
+                        "metadata": hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {},
+                    } for hit in retrieval_hits],
+                )
             except asyncio.CancelledError:
                 await asyncio.shield(mark_turn_failed(session.conversation_id, resolved_turn_id))
                 raise
@@ -151,22 +283,48 @@ class AgentService:
                 # RAG remains optional; a RAG failure never changes Gateway memory state.
                 print(f"[agent] rag unavailable error={type(exc).__name__}")
                 rag_context = ""
+                await trace("retrieval", "degraded", "Gateway 向量检索不可用，本轮按通用知识继续回答", error=type(exc).__name__)
 
             recent_user_messages = [
                 message["content"]
                 for message in history[:-1]
                 if message.get("role") == "user" and isinstance(message.get("content"), str)
             ][-6:]
+            recent_conversation = [
+                {"role": message["role"], "content": message["content"]}
+                for message in history[-12:]
+                if message.get("role") in {"user", "assistant"}
+                and isinstance(message.get("content"), str)
+            ]
+            recent_project_context = " ".join(
+                message["content"]
+                for message in history[-12:]
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            )
+            active_project_ids = resolve_project_ids(
+                user_projects, text, recent_project_context
+            )
+            active_project_names = [
+                project["name"]
+                for project in user_projects
+                if project.get("id") in active_project_ids
+                and isinstance(project.get("name"), str)
+            ]
 
             async def extract_and_persist_context() -> None:
                 """与回答生成并行提取候选；保存失败不影响已经生成的回答。"""
 
                 try:
+                    await trace("memory_analysis", "running", "记忆分析 LLM 正在检查画像和长期记忆更新")
                     extraction = await get_llm_service().extract_user_context(
                         text,
                         recent_user_messages,
                         _profile,
                         current_long_term_memories=_memories,
+                        recent_conversation=recent_conversation,
+                        known_projects=user_projects,
+                        active_project_name="、".join(active_project_names) or None,
                         turn_id=resolved_turn_id,
                     )
                     persistence_stats, persistence_errors = await persist_extracted_context_updates(
@@ -176,6 +334,48 @@ class AgentService:
                         current_user_text=text,
                         recent_user_messages=recent_user_messages,
                         current_long_term_memories=_memories,
+                        user_projects=user_projects,
+                        current_profile=_profile,
+                    )
+                    await trace(
+                        "memory_analysis",
+                        "completed" if not persistence_errors else "degraded",
+                        "记忆分析完成",
+                        profile_candidates=persistence_stats["profile_candidates"],
+                        profile_accepted=persistence_stats["profile_updates_accepted"],
+                        profile_saved=persistence_stats["profile_updates_written"],
+                        profile_rejected=(
+                            persistence_stats["profile_rejected_evidence"]
+                            + persistence_stats["profile_rejected_confidence"]
+                            + persistence_stats["profile_rejected_schema"]
+                            + persistence_stats["profile_rejected_sensitive"]
+                        ),
+                        memory_candidates=persistence_stats["memory_candidates"],
+                        memory_accepted=persistence_stats["memory_candidates_accepted"],
+                        memory_rejected_profile_overlap=persistence_stats["memory_rejected_profile_overlap"],
+                        memories_saved=persistence_stats["long_term_memories_written"],
+                        memories_updated=persistence_stats["long_term_memories_updated"],
+                        memories_duplicate=persistence_stats["memory_duplicates"],
+                        memories_rejected=(
+                            persistence_stats["memory_rejected_evidence"]
+                            + persistence_stats["memory_rejected_confidence"]
+                            + persistence_stats["memory_rejected_content"]
+                            + persistence_stats["memory_rejected_profile_overlap"]
+                            + persistence_stats["memory_rejected_sensitive"]
+                            + persistence_stats["memory_rejected_reference"]
+                        ),
+                        llm_output={
+                            "profile_updates": extraction.get("profile_updates", []),
+                            "long_term_memories": extraction.get("long_term_memories", []),
+                        },
+                        persistence_result={
+                            "rule_profile_candidates": persistence_stats.get("profile_rule_candidates", []),
+                            "validated_profile_updates": persistence_stats.get("validated_profile_updates", []),
+                            "validated_memories": persistence_stats.get("validated_memories", []),
+                            "memory_vector_sync": persistence_stats.get("memory_vector_sync_results", []),
+                            "errors": persistence_errors,
+                        },
+                        errors=persistence_errors,
                     )
                     print(
                         f"[agent][memory] persisted turn_id={resolved_turn_id} "
@@ -184,17 +384,23 @@ class AgentService:
                         f"long_term_memories_updated={persistence_stats['long_term_memories_updated']} "
                         f"profile_candidates={persistence_stats['profile_candidates']} "
                         f"profile_accepted={persistence_stats['profile_updates_accepted']} "
+                        f"profile_rejected_evidence={persistence_stats['profile_rejected_evidence']} "
+                        f"profile_rejected_confidence={persistence_stats['profile_rejected_confidence']} "
+                        f"profile_rejected_schema={persistence_stats['profile_rejected_schema']} "
+                        f"profile_rejected_sensitive={persistence_stats['profile_rejected_sensitive']} "
                         f"memory_candidates={persistence_stats['memory_candidates']} "
                         f"memory_accepted={persistence_stats['memory_candidates_accepted']} "
                         f"memory_rejected_evidence={persistence_stats['memory_rejected_evidence']} "
                         f"memory_rejected_confidence={persistence_stats['memory_rejected_confidence']} "
                         f"memory_rejected_content={persistence_stats['memory_rejected_content']} "
+                        f"memory_rejected_profile_overlap={persistence_stats['memory_rejected_profile_overlap']} "
                         f"memory_rejected_sensitive={persistence_stats['memory_rejected_sensitive']} "
                         f"memory_rejected_reference={persistence_stats['memory_rejected_reference']} "
                         f"memory_duplicates={persistence_stats['memory_duplicates']} "
                         f"errors={','.join(persistence_errors) if persistence_errors else 'none'}"
                     )
                 except Exception as exc:
+                    await trace("memory_analysis", "failed", "记忆分析或保存失败，不影响回答", error=type(exc).__name__)
                     # Keep private content and upstream error bodies out of logs and user responses.
                     status_code = getattr(exc, "status_code", None)
                     print(
@@ -221,6 +427,10 @@ class AgentService:
             memory_task.add_done_callback(clear_memory_task)
 
             try:
+                await trace(
+                    "answer", "running", "回答 LLM 正在使用上下文与检索资料生成回复",
+                    retrieval_count=len(retrieval_hits),
+                )
                 async for delta in get_llm_service().chat(
                     history, rag_context, turn_id=resolved_turn_id, system_prompt=system_prompt
                 ):
@@ -246,6 +456,7 @@ class AgentService:
                     if len(latest) < 2 or message_pair_hash(latest[-2:]) != pair_hash:
                         raise ContextGatewayError("CONTEXT_APPEND_UNCERTAIN") from append_error
                 await mark_turn_completed(session.conversation_id, resolved_turn_id)
+                await trace("answer", "completed", "回答生成并写入会话")
             except asyncio.CancelledError:
                 # Room closure may cancel this response task, but memory extraction belongs to
                 # the authenticated conversation and must continue independently.

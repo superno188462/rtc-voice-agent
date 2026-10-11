@@ -8,6 +8,7 @@ import { Tooltip, Typography } from '@arco-design/web-react';
 import { useSelector } from 'react-redux';
 import { RootState } from '@/store';
 import Operation from './components/Operation';
+import AgentTracePanel from './components/AgentTracePanel';
 import CameraArea from '../MainArea/Room/CameraArea';
 import { isMobile } from '@/utils/utils';
 import { useScene } from '@/lib/useCommon';
@@ -31,6 +32,7 @@ function Menu() {
         <div className={styles.title}>AI 人设：{name}</div>
       </div>
       {isJoined ? <Operation /> : ''}
+      <AgentTracePanel />
       <div className={`${styles.box} ${styles.info}`}>
         <div className={styles.title}>{isJoined ? '其他信息' : '版本信息'}</div>
         <div className={styles.desc}>Demo Version {packageJson.version}</div>

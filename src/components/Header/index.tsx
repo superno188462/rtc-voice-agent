@@ -6,7 +6,7 @@
 import { Button, Divider, Message, Popover } from '@arco-design/web-react';
 import { IconMenu } from '@arco-design/web-react/icon';
 import { useNavigate } from 'react-router-dom';
-import { useSelector } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
 import NetworkIndicator from '@/components/NetworkIndicator';
 import { useIsMobile } from '@/utils/utils';
 import { useAuth } from '@/auth/AuthContext';
@@ -14,6 +14,7 @@ import { useLeave } from '@/lib/useCommon';
 import { RootState } from '@/store';
 import Logo from '@/assets/img/Logo.svg';
 import styles from './index.module.less';
+import { clearAgentTraceTurns, setAgentSessionId } from '@/store/slices/room';
 
 const Disclaimer = 'https://www.volcengine.com/docs/6348/68916';
 const ReversoContext = 'https://www.volcengine.com/docs/6348/68918';
@@ -28,15 +29,28 @@ function Header(props: HeaderProps) {
   const { children, hide } = props;
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const dispatch = useDispatch();
+  const isRetrievalTest = window.location.pathname === '/retrieval-test';
   const leaveRoom = useLeave();
   const isJoined = useSelector((state: RootState) => state.room.isJoined);
   const handleLogout = async () => {
     try {
       if (isJoined) await leaveRoom();
       await logout();
+      dispatch(clearAgentTraceTurns());
+      dispatch(setAgentSessionId(''));
       navigate('/login', { replace: true });
     } catch {
       Message.error('退出失败，请检查后端连接后重试');
+    }
+  };
+
+  const handleWorkspaceNavigation = async () => {
+    try {
+      if (isJoined) await leaveRoom();
+      navigate(isRetrievalTest ? '/' : '/retrieval-test');
+    } catch {
+      Message.error('切换页面失败，请检查后端连接后重试');
     }
   };
 
@@ -101,6 +115,9 @@ function Header(props: HeaderProps) {
           {user && (
             <>
               <span className={styles.accountName}>{user.username}</span>
+              <Button type="text" className={styles['header-right-text']} onClick={handleWorkspaceNavigation}>
+                {isRetrievalTest ? '实时对话' : '检索测试'}
+              </Button>
               <Button type="text" className={styles['header-right-text']} onClick={handleLogout}>
                 退出登录
               </Button>
