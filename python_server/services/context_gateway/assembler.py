@@ -290,10 +290,13 @@ def _memory_type(item: dict[str, Any]) -> str:
     )
 
 
-PROFILE_SCHEMA_VERSION = 4
-PROFILE_DOMAIN_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-PROFILE_RELATIONS = {
-    "likes", "dislikes", "prefers", "avoids", "proficient_in", "tends_to",
+PROFILE_SCHEMA_VERSION = 1
+PROFILE_LANGUAGE_VALUES = {"zh-CN", "en-US"}
+PROFILE_STYLE_VALUES = {"concise", "balanced", "detailed"}
+PROFILE_LIST_FIELDS = {
+    "interests": "interests",
+    "food_preferences.likes": "likes",
+    "food_preferences.dislikes": "dislikes",
 }
 ALLOWED_MEMORY_TAGS = {"学习目标", "当前目标", "稳定背景", "项目经历", "其他"}
 _MEMORY_SENSITIVE_PATTERN = re.compile(
@@ -305,65 +308,47 @@ _UNDERSPECIFIED_MEMORY_PATTERN = re.compile(
 
 
 def normalize_user_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    """规范化 v4 稳定特征，并将 v3 偏好记录迁移到兼容结构。"""
+    """将网关画像限制为本项目定义的版本化字段，忽略未知字段和错误类型。"""
 
-    normalized: dict[str, Any] = {"schema_version": PROFILE_SCHEMA_VERSION}
-    raw_traits = profile.get("traits")
-    raw_preferences = profile.get("preferences")
-    candidates: list[dict[str, Any]] = []
-    if isinstance(raw_traits, list):
-        candidates.extend(item for item in raw_traits[:100] if isinstance(item, dict))
-    elif isinstance(raw_preferences, list):
-        # Preserve existing v3 preferences during the schema upgrade.
-        for item in raw_preferences[:100]:
-            if not isinstance(item, dict):
-                continue
-            relation = {"like": "likes", "dislike": "dislikes", "prefer": "prefers", "avoid": "avoids"}.get(item.get("stance"))
-            if relation:
-                candidates.append({**item, "relation": relation})
-    if candidates:
-        traits: dict[tuple[str, str, str], dict[str, str | None]] = {}
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            domain = item.get("domain")
-            subject = item.get("subject")
-            relation = item.get("relation")
-            value = item.get("value")
-            if (
-                not isinstance(domain, str)
-                or not PROFILE_DOMAIN_PATTERN.fullmatch(domain.strip().lower())
-                or not isinstance(subject, str)
-                or not isinstance(relation, str)
-                or relation not in PROFILE_RELATIONS
-                or (value is not None and not isinstance(value, str))
-            ):
-                continue
-            domain = domain.strip().lower()
-            subject = subject.strip()[:120]
-            value = value.strip()[:120] if isinstance(value, str) else None
-            if not subject or _is_sensitive(subject) or (value and _is_sensitive(value)):
-                continue
-            key = _profile_trait_key(domain, subject, relation)
-            traits[key] = {
-                "domain": domain,
-                "relation": relation,
-                "subject": subject,
-                "value": value,
-            }
-        if traits:
-            normalized["traits"] = list(traits.values())
+    normalized: dict[str, Any] = {}
+    if profile.get("schema_version") == PROFILE_SCHEMA_VERSION:
+        normalized["schema_version"] = PROFILE_SCHEMA_VERSION
+    language = profile.get("preferred_language")
+    if isinstance(language, str) and language in PROFILE_LANGUAGE_VALUES:
+        normalized["preferred_language"] = language
+    style = profile.get("response_style")
+    if isinstance(style, str) and style in PROFILE_STYLE_VALUES:
+        normalized["response_style"] = style
+    interests = _clean_string_list(profile.get("interests"), limit=20, max_length=80)
+    if interests:
+        normalized["interests"] = interests
+    preferences = profile.get("food_preferences")
+    if isinstance(preferences, dict):
+        food_preferences = {
+            key: _clean_string_list(preferences.get(key), limit=20, max_length=80)
+            for key in ("likes", "dislikes")
+        }
+        if food_preferences["likes"] or food_preferences["dislikes"]:
+            normalized["food_preferences"] = food_preferences
     return normalized
 
 
-def _profile_trait_key(domain: str, subject: str, relation: str) -> tuple[str, str, str]:
-    """同一对象的正反偏好视为可替换关系，其他特征按关系分别保存。"""
-    if relation in {"likes", "dislikes"}:
-        return "", subject.casefold(), "taste"
-    if relation in {"prefers", "avoids"}:
-        return "", subject.casefold(), "choice"
-    relation_group = relation
-    return domain, subject.casefold(), relation_group
+def _clean_string_list(value: Any, limit: int, max_length: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()[:max_length]
+        key = item.casefold()
+        if item and key not in seen and not _is_sensitive(item):
+            seen.add(key)
+            result.append(item)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _is_sensitive(value: str) -> bool:
@@ -406,11 +391,11 @@ def _provided_memory_ids(memories: list[dict[str, Any]] | None) -> set[str]:
 
 def _validated_profile_updates(
     candidates: Any, user_messages: list[str], min_confidence: float
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, str]], dict[str, int]]:
     rejected = {"evidence": 0, "confidence": 0, "schema": 0, "sensitive": 0}
     if not isinstance(candidates, list):
         return [], rejected
-    valid: list[dict[str, Any]] = []
+    valid: list[dict[str, str]] = []
     for item in candidates[:10]:
         if not isinstance(item, dict):
             rejected["schema"] += 1
@@ -423,153 +408,96 @@ def _validated_profile_updates(
         except (TypeError, ValueError):
             rejected["confidence"] += 1
             continue
+        field = item.get("field")
         action = item.get("action")
-        domain = item.get("domain")
-        subject = item.get("subject")
-        relation = item.get("relation")
         value = item.get("value")
         if not math.isfinite(confidence) or not min_confidence <= confidence <= 1:
             rejected["confidence"] += 1
             continue
-        if not isinstance(action, str) or action not in {"upsert", "remove"}:
+        if not isinstance(field, str) or not isinstance(action, str):
             rejected["schema"] += 1
             continue
-        if (
-            not isinstance(domain, str)
-            or not PROFILE_DOMAIN_PATTERN.fullmatch(domain.strip().lower())
-            or not isinstance(subject, str)
-            or not subject.strip()
-            or not isinstance(relation, str)
-            or relation not in PROFILE_RELATIONS
-            or (value is not None and not isinstance(value, str))
-        ):
+        if not isinstance(value, str) or not value.strip():
             rejected["schema"] += 1
             continue
-        domain = domain.strip().lower()
-        subject = subject.strip()[:120]
-        value = value.strip()[:120] if isinstance(value, str) else None
-        if _is_sensitive(subject) or (value and _is_sensitive(value)):
+        value = value.strip()[:80]
+        if _is_sensitive(value):
             rejected["sensitive"] += 1
             continue
-        valid.append({
-            "action": action,
-            "domain": domain,
-            "relation": relation,
-            "subject": subject,
-            "value": value,
-        })
+        if field == "preferred_language" and action == "set" and value in PROFILE_LANGUAGE_VALUES:
+            valid.append({"field": field, "action": action, "value": value})
+        elif field == "response_style" and action == "set" and value in PROFILE_STYLE_VALUES:
+            valid.append({"field": field, "action": action, "value": value})
+        elif field in PROFILE_LIST_FIELDS and action in {"add", "remove", "set"}:
+            # The extraction JSON Schema permits "set" for every field. For a
+            # list field, interpret it as an additive preference to avoid
+            # replacing previously collected values.
+            valid.append(
+                {
+                    "field": field,
+                    "action": "add" if action == "set" else action,
+                    "value": value,
+                }
+            )
+        else:
+            rejected["schema"] += 1
     return valid, rejected
 
 
 def _known_profile_values(
-    profile: Any, updates: list[dict[str, Any]]
+    profile: Any, updates: list[dict[str, str]]
 ) -> set[str]:
     """Return values represented in the current profile or accepted this turn."""
 
     values: set[str] = set()
     normalized = normalize_user_profile(profile) if isinstance(profile, dict) else {}
-    traits = normalized.get("traits", [])
-    removed_keys: set[tuple[str, str, str]] = set()
+    values.update(normalized.get("interests", []))
+    food = normalized.get("food_preferences", {})
+    if isinstance(food, dict):
+        values.update(food.get("likes", []))
+        values.update(food.get("dislikes", []))
     for update in updates:
-        key = _profile_trait_key(update["domain"], update["subject"], update["relation"])
-        if update["action"] == "remove":
-            removed_keys.add(key)
-        else:
-            removed_keys.discard(key)
-    for trait in traits:
-        key = _profile_trait_key(trait["domain"], trait["subject"], trait["relation"])
-        if key in removed_keys:
+        if update["field"] not in PROFILE_LIST_FIELDS:
             continue
-        values.add(trait["subject"])
-        if trait.get("value"):
-            values.add(trait["value"])
-    for update in updates:
-        if update["action"] != "remove":
-            values.add(update["subject"])
-            if update.get("value"):
-                values.add(update["value"])
+        if update["action"] == "remove":
+            values = {
+                value for value in values
+                if value.casefold() != update["value"].casefold()
+            }
+        else:
+            values.add(update["value"])
     return {value.strip().casefold() for value in values if isinstance(value, str) and len(value.strip()) >= 2}
 
 
 def _apply_profile_updates(
-    profile: dict[str, Any], updates: list[dict[str, Any]]
+    profile: dict[str, Any], updates: list[dict[str, str]]
 ) -> dict[str, Any]:
     merged = normalize_user_profile(profile)
     merged["schema_version"] = PROFILE_SCHEMA_VERSION
     for update in updates:
-        key = _profile_trait_key(update["domain"], update["subject"], update["relation"])
-        traits = {
-            _profile_trait_key(item["domain"], item["subject"], item["relation"]): item
-            for item in merged.get("traits", [])
-        }
-        if update["action"] == "remove":
-            traits.pop(key, None)
+        field, action, value = update["field"], update["action"], update["value"]
+        if action == "set":
+            merged[field] = value
+            continue
+        if field == "interests":
+            values = list(merged.get("interests", []))
+            nested = None
         else:
-            traits[key] = {
-                "domain": update["domain"],
-                "relation": update["relation"],
-                "subject": update["subject"],
-                "value": update.get("value"),
-            }
-        if traits:
-            merged["traits"] = list(traits.values())
+            nested_key, value_key = field.split(".", 1)
+            nested = dict(merged.get(nested_key, {}))
+            values = list(nested.get(value_key, []))
+        existing = {entry.casefold(): entry for entry in values}
+        if action == "remove":
+            existing.pop(value.casefold(), None)
+        elif len(existing) < 20:
+            existing.setdefault(value.casefold(), value)
+        result = list(existing.values())
+        if nested is None:
+            merged[field] = result
         else:
-            merged.pop("traits", None)
+            nested[value_key] = result
+            merged[nested_key] = nested
     return merged
-
-
-_PROFILE_PREFERENCE_LANGUAGE = re.compile(
-    r"(?:喜欢|喜爱|偏好|爱吃|爱喝|好吃|好喝|最爱|不喜欢|不感兴趣|感兴趣|不爱吃|讨厌|更喜欢|更倾向|擅长|精通|倾向于)"
-)
-
-
-def _extract_explicit_profile_updates(messages: list[str]) -> list[dict[str, Any]]:
-    """从明确、非临时的用户自述提取候选；最终仍经过统一证据和隐私校验。"""
-    updates: dict[tuple[str, str, str], dict[str, Any]] = {}
-    temporary = re.compile(r"(?:今天|这次|这回|暂时|目前|最近|现在|刚才)")
-    patterns = (
-        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:不喜欢|不爱吃|不爱喝|讨厌)(?:吃|喝)?(.+)$"), "dislikes", "topic"),
-        (re.compile(r"^(?:我)?对(.+?)不感兴趣$"), "dislikes", "topic"),
-        (re.compile(r"^(?:我)?(?:喜欢|偏好)(?:回答|回复)(.+)$"), "prefers", "communication"),
-        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:喜欢|喜爱|爱吃|爱喝)(?:吃|喝)(.+)$"), "likes", "food"),
-        (re.compile(r"^(?:我)?(?:很|特别|非常)?(?:喜欢|喜爱)(.+)$"), "likes", "topic"),
-        (re.compile(r"^(?:我)?(?:擅长|精通|熟悉)(.+)$"), "proficient_in", "skill"),
-        (re.compile(r"^(?:我)?(?:(?:做事|做决定|决策)时)?(?:(?:通常|一般|一向))?(.*?)倾向于(.+)$"), "tends_to", "decision_style"),
-    )
-    for original in messages:
-        if not isinstance(original, str):
-            continue
-        text = re.sub(r"^[\s，,。.!！?？]+|[\s，,。.!！?？]+$", "", original.strip())
-        if not text or temporary.search(text):
-            continue
-        for pattern, relation, domain in patterns:
-            match = pattern.fullmatch(text)
-            if not match:
-                continue
-            if relation == "tends_to":
-                subject = match.group(1).strip() or "做事方式"
-                value = match.group(2).strip()
-            elif relation == "prefers" and domain == "communication":
-                subject = "回答风格"
-                value = match.group(1).strip()
-            else:
-                subject = match.group(1).strip()
-                value = None
-            subject = re.sub(r"[，,。.!！?？]+$", "", subject).strip()
-            if not subject or len(subject) > 120 or _is_sensitive(subject) or (value and _is_sensitive(value)):
-                break
-            candidate = {
-                "action": "upsert",
-                "domain": domain,
-                "relation": relation,
-                "subject": subject[:120],
-                "value": value[:120] if value else None,
-                "evidence": original,
-                "confidence": 1.0,
-            }
-            updates[_profile_trait_key(domain, subject, relation)] = candidate
-            break
-    return list(updates.values())
 
 
 async def persist_extracted_context_updates(
@@ -593,23 +521,6 @@ async def persist_extracted_context_updates(
     except ValueError:
         min_confidence = 0.75
     raw_profile_updates = extraction.get("profile_updates")
-    if not isinstance(raw_profile_updates, list):
-        raw_profile_updates = []
-    # Deterministic fallback for clear first-person traits avoids depending on
-    # the extractor to recognize every simple preference or capability.
-    explicit_updates = _extract_explicit_profile_updates([current_user_text])
-    if explicit_updates:
-        by_key = {
-            _profile_trait_key(item["domain"], item["subject"], item["relation"]): item
-            for item in raw_profile_updates
-            if isinstance(item, dict)
-            and isinstance(item.get("domain"), str)
-            and isinstance(item.get("subject"), str)
-            and isinstance(item.get("relation"), str)
-        }
-        for item in explicit_updates:
-            by_key[_profile_trait_key(item["domain"], item["subject"], item["relation"])] = item
-        raw_profile_updates = list(by_key.values())
     profile_updates, profile_rejected = _validated_profile_updates(
         raw_profile_updates, evidence_messages, min_confidence=min_confidence
     )
@@ -709,11 +620,8 @@ async def persist_extracted_context_updates(
                 rejected["sensitive"] += 1
                 continue
             if (
-                scope == "global"
-                and (
-                    memory_role == "preference"
-                    or _PROFILE_PREFERENCE_LANGUAGE.search(content)
-                )
+                memory_role == "preference"
+                and scope == "global"
                 and any(value in content.casefold() for value in known_profile_values)
             ):
                 rejected["profile_overlap"] += 1
@@ -913,7 +821,6 @@ async def persist_extracted_context_updates(
     accepted_memory_count = len(memories)
     stats = {
         "profile_candidates": len(raw_profile_updates) if isinstance(raw_profile_updates, list) else 0,
-        "profile_rule_candidates": explicit_updates,
         "profile_updates_accepted": len(profile_updates),
         "profile_updates_written": applied_profile_updates,
         "profile_rejected_evidence": profile_rejected["evidence"],
@@ -964,19 +871,19 @@ def explicit_memory_request(text: str) -> str | None:
 
 
 def explicit_profile_patch(text: str) -> dict[str, Any]:
-    """从明确要求长期应用的沟通偏好构造 v4 traits 补丁。"""
+    """仅从明确、稳定的表达偏好语句提取当前项目画像字段。"""
 
     value = text.strip()
     if not re.search(r"(?:以后|今后|请一直|默认)", value):
         return {}
-    traits: list[dict[str, str | None]] = []
+    patch: dict[str, Any] = {}
     if re.search(r"中文.{0,8}(?:回答|回复)|(?:用|使用|请用|请使用)中文回答|偏好中文", value):
-        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_language", "value": "中文"})
+        patch["preferred_language"] = "zh-CN"
     elif re.search(r"英文.{0,8}(?:回答|回复)|(?:用|使用|请用|请使用)英文回答|偏好英文", value):
-        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_language", "value": "英文"})
+        patch["preferred_language"] = "en-US"
     if re.search(r"(?:简洁|简短|精炼).{0,12}(?:回答|回复)|(?:回答|回复).{0,12}(?:简洁|简短|精炼)", value):
-        traits.append({"domain": "communication", "relation": "prefers", "subject": "response_style", "value": "简洁"})
-    return {"schema_version": PROFILE_SCHEMA_VERSION, "traits": traits} if traits else {}
+        patch["response_style"] = "concise"
+    return patch
 
 
 def message_pair_hash(messages: list[dict[str, str]]) -> str:
@@ -1081,11 +988,7 @@ async def persist_explicit_preferences(
     if not profile:
         version = None
     for attempt in range(2):
-        updates = [
-            {"action": "upsert", **trait}
-            for trait in patch.get("traits", [])
-        ]
-        merged = _apply_profile_updates(profile, updates)
+        merged = {**profile, **patch}
         try:
             await client.put_profile(external_user_id, merged, version)
             return
