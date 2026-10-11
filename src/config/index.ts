@@ -10,7 +10,9 @@ export const UserAgreement = 'https://www.volcengine.com/docs/6348/128955';
 /**
  * @note 请求后端 API 的地址，可通过 REACT_APP_API_HOST 配置。
  */
-export const AIGC_PROXY_HOST = process.env.REACT_APP_API_HOST || 'http://localhost:8002';
+export const AIGC_PROXY_HOST =
+  process.env.REACT_APP_API_HOST ??
+  (process.env.NODE_ENV === 'development' ? 'http://localhost:8002' : '');
 
 export interface IScene {
   icon: string;

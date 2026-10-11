@@ -1,8 +1,12 @@
 # 交互式AIGC场景 AIGC Demo
 
-> 本目录是从 `rtc-aigc-demo` 迁移出的工作副本。当前前端已使用自有 Agent 编排：RTC 本地 PCM 由后端转发至豆包 Seed ASR 2.0，最终识别结果触发固定 mock LLM 回复；不调用火山 Agent，不使用 TTS。配置边界和迁移步骤见[自有 Agent 与火山 RTC 迁移设计](设计文档/自有Agent与火山RTC迁移设计.md)。
+> 本目录是语音 Agent 项目：RTC 音频由后端转发到 Gateway ASR，Agent 使用 Gateway 向量检索和配置的 LLM，TTS 直连火山服务；用户认证由统一身份中心处理。部署方式见[Docker 部署手册](deploy/DEPLOYMENT.md)，本地配置与开发启动见 `python_server/README.md`。
 
-## 本地运行 mock Agent
+## Docker 部署
+
+服务器部署文件位于 `deploy/`。按[部署手册](deploy/DEPLOYMENT.md)配置环境变量、RTC 场景和 HTTPS 反向代理后，可用 Docker Compose 启动前端、后端及 PostgreSQL。
+
+## 本地运行 Agent
 
 需要两个终端。先在 `python_server/scenes/Custom.json` 填入 RTC 控制台的 AppId 和 AppKey（不要提交真实配置）：
 
@@ -20,7 +24,7 @@ cd /d/github/课程/sts
 npm run dev
 ```
 
-浏览器打开 `http://localhost:3002`，加入 RTC 房间并允许麦克风。配置 ASR API Key 后，说话内容由 Seed ASR 2.0 转写，字幕区再显示固定 mock LLM 回复。该阶段不连接 LLM 网关、不调用火山 Agent，也不合成语音。配置和链路细节见 `python_server/README.md`。
+浏览器打开 `http://localhost:3002`，登录后加入 RTC 房间并允许麦克风。后端使用 `python_server/.env` 中配置的身份中心、Gateway、LLM、ASR 和火山 TTS 服务。配置和链路细节见 `python_server/README.md`。
 
 前端默认端口为 `3002`，后端默认端口为 `8002`。后端可用 `uv run python app.py --port 8001` 指定端口；前端可通过 `PORT=3003 npm run dev` 指定端口（PowerShell 使用 `$env:PORT="3003"; npm run dev`）。如果后端不是 `8002`，前端同时设置 `REACT_APP_API_HOST` 指向新的后端地址。如更改前端端口，请将新来源加入 `python_server/.env` 中的 `CORS_ALLOW_ORIGINS`。详细命令见 `python_server/README.md`。
 
